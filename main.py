@@ -781,7 +781,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
-<title>Mendikot</title>
+<title>Das Fabi</title>
 <style>
   :root {
     --bg-deep: #2B0E17;
@@ -1503,7 +1503,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <!-- ============ HOME VIEW ============ -->
   <div id="view-home" class="home-wrap">
-    <h1 class="home-title">Mendikot<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
+    <h1 class="home-title">ꯗ꯭ꯁ ꯐꯥꯕꯤ<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
 
     <div class="home-card">
       <div class="error-banner" id="home-error"></div>
