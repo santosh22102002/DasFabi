@@ -386,13 +386,14 @@ class MendikotHand:
         return state
 
 
-"""Room management: lobby state, seating, connection tracking, GC of stale rooms."""
+"""Room management: lobby state, team-based seating, connection tracking, GC of stale rooms."""
 
 
 
 ROOM_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/I/1 ambiguity
 ROOM_TTL_SECONDS = 10 * 60  # GC empty/stale rooms after 10 min
-RECONNECT_GRACE_SECONDS = 60
+
+TEAM_SEATS = {"A": (0, 2), "B": (1, 3)}
 
 
 def gen_room_code(existing: set[str], length: int = 5) -> str:
@@ -409,7 +410,6 @@ class Player:
     seat: int
     ws: Optional[WebSocket] = None
     connected: bool = True
-    disconnected_at: Optional[float] = None
 
 
 @dataclass
@@ -421,6 +421,7 @@ class Room:
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
     locked_until: float = 0.0  # monotonic time; no new plays accepted before this
+    cancelled: bool = False  # set once any player explicitly exits, or host leaves
 
     def touch(self):
         self.last_active = time.time()
@@ -434,17 +435,17 @@ class Room:
     def is_full(self) -> bool:
         return len(self.players) == 4
 
-    def is_empty(self) -> bool:
-        return all(not p.connected for p in self.players.values()) if self.players else True
+    def team_of(self, seat: int) -> str:
+        return "A" if seat in TEAM_SEATS["A"] else "B"
 
-    def next_open_seat(self) -> Optional[int]:
-        for s in range(4):
+    def open_seat_for_team(self, team: str) -> Optional[int]:
+        for s in TEAM_SEATS.get(team, ()):
             if s not in self.players:
                 return s
         return None
 
-    def team_of(self, seat: int) -> str:
-        return "A" if seat in (0, 2) else "B"
+    def team_is_full(self, team: str) -> bool:
+        return self.open_seat_for_team(team) is None
 
     def lobby_state(self) -> dict:
         return {
@@ -458,6 +459,10 @@ class Room:
                 }
                 for s, p in self.players.items()
             },
+            "team_full": {
+                "A": self.team_is_full("A"),
+                "B": self.team_is_full("B"),
+            },
             "is_full": self.is_full(),
             "host_seat": 0,
             "game_in_progress": self.hand is not None and self.hand.phase.value != "HAND_COMPLETE",
@@ -468,31 +473,34 @@ class RoomManager:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
 
-    def create_room(self, host_name: str, host_player_id: str) -> tuple[Room, Player]:
+    def create_room(self, host_name: str, host_player_id: str, team: str) -> tuple[Room, Player]:
         code = gen_room_code(set(self.rooms.keys()))
         room = Room(code=code)
-        player = Player(player_id=host_player_id, name=host_name, seat=0)
-        room.players[0] = player
+        seat = TEAM_SEATS[team][0]  # host always takes the first seat of their chosen team
+        player = Player(player_id=host_player_id, name=host_name, seat=seat)
+        room.players[seat] = player
         self.rooms[code] = room
         return room, player
 
-    def join_room(self, code: str, name: str, player_id: str) -> tuple[Optional[Room], Optional[Player], Optional[str]]:
+    def join_room(self, code: str, name: str, player_id: str, team: str) -> tuple[Optional[Room], Optional[Player], Optional[str]]:
         room = self.rooms.get(code)
         if room is None:
             return None, None, "ROOM_NOT_FOUND"
 
-        # reconnect case: same player_id already seated
+        # reconnect case: same player_id already seated (e.g. brief network drop, not an explicit exit)
         for p in room.players.values():
             if p.player_id == player_id:
                 p.connected = True
-                p.disconnected_at = None
                 room.touch()
                 return room, p, None
 
         if room.is_full():
             return None, None, "ROOM_FULL"
 
-        seat = room.next_open_seat()
+        seat = room.open_seat_for_team(team)
+        if seat is None:
+            return None, None, "TEAM_FULL"
+
         player = Player(player_id=player_id, name=name, seat=seat)
         room.players[seat] = player
         room.touch()
@@ -514,8 +522,11 @@ class RoomManager:
     def mark_disconnected(self, room: Room, seat: int):
         if seat in room.players:
             room.players[seat].connected = False
-            room.players[seat].disconnected_at = time.time()
             room.players[seat].ws = None
+
+    def cancel_room(self, code: str):
+        if code in self.rooms:
+            del self.rooms[code]
 
 
 """FastAPI WebSocket server for Mendikot. Orchestrates rooms + game engine."""
@@ -562,6 +573,17 @@ def rotate_dealer(room):
     room.dealer_seat = (room.dealer_seat + 1) % 4
 
 
+async def cancel_room_and_notify(room, leaving_seat: int, reason: str = "player_left"):
+    """Any player exiting (host or not) cancels the room entirely for everyone."""
+    room.cancelled = True
+    await broadcast(room, {
+        "type": "room_cancelled",
+        "reason": reason,
+        "leaving_seat": leaving_seat,
+    })
+    manager.cancel_room(room.code)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -583,8 +605,12 @@ async def websocket_endpoint(ws: WebSocket):
             # ---------------- CREATE ROOM ----------------
             if mtype == "create_room":
                 name = (msg.get("player_name") or "Host").strip()[:20] or "Host"
+                team = msg.get("team")
+                if team not in ("A", "B"):
+                    await send_json(ws, {"type": "error", "message": "Choose a team"})
+                    continue
                 player_id = str(uuid.uuid4())
-                room, player = manager.create_room(name, player_id)
+                room, player = manager.create_room(name, player_id, team)
                 player.ws = ws
                 seat = player.seat
                 await send_json(ws, {
@@ -600,8 +626,19 @@ async def websocket_endpoint(ws: WebSocket):
                 code = (msg.get("room_code") or "").strip().upper()
                 name = (msg.get("player_name") or "Player").strip()[:20] or "Player"
                 pid = msg.get("player_id") or str(uuid.uuid4())
+                team = msg.get("team")
 
-                r, player, err = manager.join_room(code, name, pid)
+                # team is required for NEW joins, but not for reconnects (server
+                # already knows their seat/team from a prior join in this room)
+                existing_room = manager.get_room(code)
+                is_reconnect = existing_room is not None and any(
+                    p.player_id == pid for p in existing_room.players.values()
+                )
+                if not is_reconnect and team not in ("A", "B"):
+                    await send_json(ws, {"type": "error", "message": "Choose a team"})
+                    continue
+
+                r, player, err = manager.join_room(code, name, pid, team)
                 if err:
                     await send_json(ws, {"type": "error", "message": err})
                     continue
@@ -736,6 +773,15 @@ async def websocket_endpoint(ws: WebSocket):
                     # need to play into it normally, no pause needed here.
                     await send_hand_state_to_all(room)
 
+            # ---------------- EXIT GAME (explicit, cancels room for everyone) ----------------
+            elif mtype == "exit_game":
+                if room is None or seat is None:
+                    await send_json(ws, {"type": "error", "message": "Not in a room"})
+                    continue
+                await cancel_room_and_notify(room, seat, reason="player_left")
+                room = None
+                seat = None
+
             # ---------------- REMATCH ----------------
             elif mtype == "rematch":
                 if room is None:
@@ -756,9 +802,16 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        # A dropped connection (closed tab, lost network) is NOT the same as
+        # an explicit Exit tap - we don't cancel the room here, just mark this
+        # seat disconnected so others can see it. Explicit exits are handled
+        # entirely by the exit_game branch above, which already nulls out
+        # `room`/`seat` before we get here, so this block is a no-op for that
+        # case (avoids double-cancelling or cancelling an already-gone room).
         if room is not None and seat is not None:
             manager.mark_disconnected(room, seat)
-            await broadcast(room, room.lobby_state())
+            if not room.cancelled:
+                await broadcast(room, room.lobby_state())
 
 
 async def gc_loop():
@@ -781,21 +834,22 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
-<title>Das Fabi</title>
+<title>Mendikot</title>
 <style>
   :root {
-    --bg-deep: #2B0E17;
-    --bg-panel: #3D1220;
-    --bg-panel-2: #4A1826;
+    --bg-deep: #0B2318;
+    --bg-panel: #123526;
+    --bg-panel-2: #16412E;
+    --felt: #1B4D34;
+    --felt-light: #235E3F;
     --gold: #D4A24C;
     --gold-bright: #E8BE6E;
     --cream: #F5EDE0;
     --ink: #1C1410;
-    --teal: #2F6B62;
-    --teal-bright: #3F8B7E;
-    --red-suit: #A6362C;
-    --line: rgba(212, 162, 76, 0.25);
-    --shadow: rgba(0, 0, 0, 0.45);
+    --teal-bright: #5FCB9E;
+    --red-suit: #C0453A;
+    --line: rgba(212, 162, 76, 0.22);
+    --shadow: rgba(0, 0, 0, 0.5);
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -805,7 +859,7 @@ INDEX_HTML = """<!DOCTYPE html>
     height: 100vh;
     height: 100dvh;
     background:
-      radial-gradient(ellipse at top, #431828 0%, var(--bg-deep) 65%);
+      radial-gradient(ellipse at top, #1E5638 0%, var(--bg-deep) 68%);
     font-family: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
     color: var(--cream);
     overflow: hidden;
@@ -840,10 +894,10 @@ INDEX_HTML = """<!DOCTYPE html>
     overflow: hidden;
   }
 
-  /* Home and room/lobby views are short enough to allow scrolling if a very
-     small device ever needs it (e.g. landscape phone with keyboard open) -
-     only the game view has a hard no-scroll requirement. */
-  #view-home, #view-room {
+  /* Menu, create/join, and room/lobby views are short enough to allow
+     scrolling if a very small device ever needs it (e.g. landscape phone
+     with keyboard open) - only the game view has a hard no-scroll requirement. */
+  #view-menu, #view-create, #view-join, #view-room {
     overflow-y: auto;
     min-height: 0;
   }
@@ -946,21 +1000,134 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .btn-secondary:hover:not(:disabled) { background: rgba(63,139,126,0.12); }
 
-  .or-divider {
+  .menu-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 100%;
+    max-width: 340px;
+  }
+
+  .screen-title {
+    font-size: 26px;
+    color: var(--gold-bright);
+    margin: 0 0 4px;
+    text-align: center;
+  }
+
+  .back-link {
+    background: none;
+    border: none;
+    color: rgba(245,237,224,0.55);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    align-self: flex-start;
+    padding: 4px 0;
+    margin-bottom: 4px;
+  }
+  .back-link:hover { color: var(--cream); }
+
+  .team-picker {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .team-btn {
+    flex: 1;
+    padding: 14px 8px;
+    background: rgba(245,237,224,0.04);
+    border: 1.5px solid rgba(245,237,224,0.18);
+    border-radius: 4px;
+    color: rgba(245,237,224,0.7);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 0.15s ease;
+  }
+  .team-btn.team-a.selected {
+    border-color: var(--gold);
+    background: rgba(212,162,76,0.16);
+    color: var(--gold-bright);
+    box-shadow: 0 0 0 1px var(--gold) inset;
+  }
+  .team-btn.team-b.selected {
+    border-color: var(--teal-bright);
+    background: rgba(95,203,158,0.14);
+    color: var(--teal-bright);
+    box-shadow: 0 0 0 1px var(--teal-bright) inset;
+  }
+  .team-btn.full {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .team-btn:disabled { cursor: not-allowed; }
+
+  .exit-link {
+    background: none;
+    border: none;
+    color: rgba(245,237,224,0.4);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    margin-top: 18px;
+    padding: 6px;
+  }
+  .exit-link:hover { color: var(--red-suit); }
+
+  .exit-icon-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 20;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.28);
+    border: none;
+    color: rgba(245,237,224,0.6);
+    font-size: 20px;
+    line-height: 1;
     display: flex;
     align-items: center;
-    gap: 12px;
-    color: rgba(245,237,224,0.4);
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    justify-content: center;
+    padding: 0;
   }
-  .or-divider::before, .or-divider::after {
-    content: "";
-    flex: 1;
-    height: 1px;
-    background: var(--line);
+  .exit-icon-btn:hover { background: rgba(166,54,44,0.5); color: var(--cream); }
+
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(4,14,9,0.82);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 90;
+    padding: 20px;
+  }
+  .confirm-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
+  .confirm-card {
+    background: var(--bg-panel);
+    border-radius: 8px;
+    padding: 28px 24px;
+    max-width: 320px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .confirm-text {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    color: var(--cream);
+    margin-bottom: 20px;
+    line-height: 1.4;
+  }
+  .confirm-buttons {
+    display: flex;
+    gap: 10px;
+  }
+  .confirm-buttons button { flex: 1; padding: 12px; font-size: 14px; }
+  .btn-danger {
+    background: var(--red-suit);
+    color: var(--cream);
   }
 
   .error-banner {
@@ -1083,38 +1250,32 @@ INDEX_HTML = """<!DOCTYPE html>
     overflow: hidden;
   }
 
-  .top-bar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px 4px clamp(6px, 1.5vh, 14px);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    flex-shrink: 0;
-  }
-
-  .mendi-counter {
+  .center-stack {
+    grid-area: center;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
-    padding: 8px 10px;
-    border-radius: 4px;
+    justify-content: center;
+    gap: clamp(4px, 1.2vh, 10px);
+    height: 100%;
+    width: 100%;
   }
-  .mendi-counter.mine { background: rgba(212,162,76,0.14); border: 1px solid rgba(212,162,76,0.35); }
-  .mendi-counter.theirs { background: rgba(63,139,126,0.14); border: 1px solid rgba(63,139,126,0.35); }
-  .mendi-counter .mendi-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    opacity: 0.7;
+
+  .scoreboard-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(8px, 2.5vw, 18px);
+    flex-shrink: 0;
   }
+
   .ten-slots {
     display: flex;
-    gap: 4px;
+    gap: clamp(2px, 0.8vw, 4px);
   }
   .ten-slot {
-    width: 24px;
-    height: 34px;
+    width: clamp(17px, 4.2vw, 22px);
+    height: clamp(24px, 6vw, 31px);
     border-radius: 3px;
     display: flex;
     flex-direction: column;
@@ -1122,58 +1283,65 @@ INDEX_HTML = """<!DOCTYPE html>
     justify-content: center;
     font-family: Georgia, 'Times New Roman', serif;
     font-weight: 700;
-    font-size: 9px;
+    font-size: 8px;
     line-height: 1;
-    gap: 1px;
-    border: 1px solid rgba(245,237,224,0.15);
-    background: rgba(245,237,224,0.04);
-    color: rgba(245,237,224,0.2);
+    background: rgba(0,0,0,0.14);
+    color: rgba(245,237,224,0.18);
     transition: transform 0.25s cubic-bezier(.2,1.4,.4,1), background 0.25s ease;
   }
-  .ten-slot .ts-rank { font-size: 9px; line-height: 1; }
-  .ten-slot .ts-suit { font-size: 12px; line-height: 1; }
+  .ten-slot .ts-suit { font-size: clamp(10px, 2.6vw, 13px); line-height: 1; }
   .ten-slot.won {
     background: var(--cream);
-    border-color: transparent;
-    transform: translateY(-2px);
+    transform: translateY(-2px) scale(1.05);
+    animation: mendiWon 0.5s cubic-bezier(.2,1.4,.4,1);
+  }
+  @keyframes mendiWon {
+    0% { transform: translateY(6px) scale(0.6) rotate(-10deg); opacity: 0; }
+    60% { transform: translateY(-4px) scale(1.12) rotate(4deg); opacity: 1; }
+    100% { transform: translateY(-2px) scale(1.05) rotate(0deg); }
   }
   .ten-slot.won.red { color: var(--red-suit); }
   .ten-slot.won.black { color: var(--ink); }
-  .ten-slot.won.mine { box-shadow: 0 2px 8px rgba(212,162,76,0.45); }
-  .ten-slot.won.theirs { box-shadow: 0 2px 8px rgba(63,139,126,0.45); }
+  .ten-slot.won.mine { box-shadow: 0 2px 10px rgba(212,162,76,0.55); }
+  .ten-slot.won.theirs { box-shadow: 0 2px 10px rgba(95,203,158,0.5); }
 
-  .trump-badge {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-  }
   .trump-card-box {
-    width: 40px;
-    height: 56px;
+    width: clamp(30px, 7.5vw, 40px);
+    height: clamp(42px, 10.5vw, 56px);
     border-radius: 5px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 26px;
-    background: rgba(245,237,224,0.04);
-    border: 1px solid rgba(245,237,224,0.15);
-    color: rgba(245,237,224,0.2);
-    transition: transform 0.25s cubic-bezier(.2,1.4,.4,1), background 0.25s ease;
+    font-size: clamp(16px, 4vw, 22px);
+    background: rgba(0,0,0,0.16);
+    color: rgba(245,237,224,0.3);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-weight: 700;
+    flex-shrink: 0;
+    transition: transform 0.3s cubic-bezier(.2,1.4,.4,1), background 0.3s ease;
   }
   .trump-card-box.revealed {
     background: var(--cream);
-    border-color: transparent;
+    animation: trumpLockIn 0.5s cubic-bezier(.2,1.4,.4,1);
+  }
+  @keyframes trumpLockIn {
+    0% { transform: scale(1.6) rotate(-6deg); opacity: 0.3; }
+    60% { transform: scale(0.92) rotate(3deg); }
+    100% { transform: scale(1) rotate(0deg); }
   }
   .trump-card-box.revealed.red { color: var(--red-suit); }
   .trump-card-box.revealed.black { color: var(--ink); }
-  .trump-card-box.revealed { box-shadow: 0 3px 10px rgba(212,162,76,0.4); }
+  .trump-card-box.revealed { box-shadow: 0 3px 12px rgba(212,162,76,0.45); }
 
   .table-felt {
     flex: 1;
-    background: radial-gradient(ellipse at center, var(--bg-panel-2) 0%, var(--bg-panel) 100%);
-    border-radius: 12px;
-    border: 1px solid var(--line);
+    background:
+      radial-gradient(ellipse at center, var(--felt-light) 0%, var(--felt) 55%, var(--bg-panel) 100%);
+    border-radius: 18px;
+    border: 1px solid rgba(212,162,76,0.15);
+    box-shadow:
+      inset 0 0 40px rgba(0,0,0,0.35),
+      inset 0 2px 0 rgba(255,255,255,0.04);
     position: relative;
     min-height: 0;
     display: grid;
@@ -1196,34 +1364,53 @@ INDEX_HTML = """<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   }
   .seat-marker .seat-mini-name {
-    font-size: 11px;
-    color: rgba(245,237,224,0.85);
-    background: rgba(0,0,0,0.3);
-    padding: 3px 9px;
-    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(245,237,224,0.75);
+    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
     white-space: nowrap;
-    max-width: 90px;
+    max-width: 92px;
     overflow: hidden;
     text-overflow: ellipsis;
+    transition: color 0.25s ease, text-shadow 0.25s ease;
+  }
+  .seat-marker .turn-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--gold-bright);
+    opacity: 0;
+    transform: scale(0.5);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    box-shadow: 0 0 8px var(--gold-bright);
   }
   .seat-marker.active .seat-mini-name {
-    background: var(--gold);
-    color: var(--ink);
-    font-weight: 700;
-    box-shadow: 0 0 10px rgba(212,162,76,0.6);
+    color: var(--gold-bright);
+    text-shadow: 0 0 10px rgba(232,190,110,0.7), 0 1px 3px rgba(0,0,0,0.6);
   }
-  .seat-marker.disconnected .seat-mini-name { opacity: 0.4; text-decoration: line-through; }
+  .seat-marker.active .turn-dot {
+    opacity: 1;
+    transform: scale(1);
+    animation: turnPulse 1.4s ease-in-out infinite;
+  }
+  @keyframes turnPulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.4); opacity: 0.6; }
+  }
+  .seat-marker.disconnected .seat-mini-name { opacity: 0.35; text-decoration: line-through; }
   .seat-marker.top { grid-area: top; }
   .seat-marker.left { grid-area: left; }
   .seat-marker.right { grid-area: right; }
   .seat-marker.bottom-marker { grid-area: bottom; }
 
   .trick-center {
-    grid-area: center;
     position: relative;
+    flex: 1;
+    width: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
+    min-height: 0;
   }
   .trick-slot {
     position: absolute;
@@ -1439,6 +1626,26 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 24px;
     margin-bottom: 26px;
   }
+  .result-mendi-row .mendi-counter {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .result-mendi-row .mendi-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    opacity: 0.6;
+  }
+  .result-mendi-row .ten-slots { gap: 5px; }
+  .result-mendi-row .ten-slot {
+    width: 26px;
+    height: 36px;
+    font-size: 10px;
+  }
+  .result-mendi-row .ten-slot .ts-suit { font-size: 15px; }
 
   .toast {
     position: fixed;
@@ -1501,23 +1708,48 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
 <div id="app">
 
-  <!-- ============ HOME VIEW ============ -->
-  <div id="view-home" class="home-wrap">
-    <h1 class="home-title">ꯗ꯭ꯁ ꯐꯥꯕꯤ<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
-
-    <div class="home-card">
-      <div class="error-banner" id="home-error"></div>
-      <label class="field-label">Your name</label>
-      <input type="text" id="player-name" placeholder="Enter your name" maxlength="20">
-      <button class="btn-primary" id="btn-create">Create Room</button>
+  <!-- ============ LANDING MENU ============ -->
+  <div id="view-menu" class="home-wrap">
+    <h1 class="home-title">Mendikot<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
+    <div class="menu-buttons">
+      <button class="btn-primary" id="btn-goto-create">Create Room</button>
+      <button class="btn-secondary" id="btn-goto-join">Join Room</button>
     </div>
+  </div>
 
-    <div class="or-divider">or join a room</div>
-
+  <!-- ============ CREATE ROOM SCREEN ============ -->
+  <div id="view-create" class="home-wrap hidden">
+    <button class="back-link" id="btn-create-back">&larr; Back</button>
+    <h2 class="screen-title">Create Room</h2>
     <div class="home-card">
+      <div class="error-banner" id="create-error"></div>
+      <label class="field-label">Your name</label>
+      <input type="text" id="create-player-name" placeholder="Enter your name" maxlength="20">
+      <label class="field-label">Choose your team</label>
+      <div class="team-picker" id="create-team-picker">
+        <button class="team-btn team-a" data-team="A">Team A</button>
+        <button class="team-btn team-b" data-team="B">Team B</button>
+      </div>
+      <button class="btn-primary" id="btn-create-confirm">Create Room</button>
+    </div>
+  </div>
+
+  <!-- ============ JOIN ROOM SCREEN ============ -->
+  <div id="view-join" class="home-wrap hidden">
+    <button class="back-link" id="btn-join-back">&larr; Back</button>
+    <h2 class="screen-title">Join Room</h2>
+    <div class="home-card">
+      <div class="error-banner" id="join-error"></div>
+      <label class="field-label">Your name</label>
+      <input type="text" id="join-player-name" placeholder="Enter your name" maxlength="20">
       <label class="field-label">Room code</label>
       <input type="text" id="join-code" placeholder="ABCDE" maxlength="5">
-      <button class="btn-secondary" id="btn-join">Join Room</button>
+      <label class="field-label">Choose your team</label>
+      <div class="team-picker" id="join-team-picker">
+        <button class="team-btn team-a" data-team="A">Team A</button>
+        <button class="team-btn team-b" data-team="B">Team B</button>
+      </div>
+      <button class="btn-secondary" id="btn-join-confirm">Join Room</button>
     </div>
   </div>
 
@@ -1534,33 +1766,27 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="waiting-note" id="waiting-note">Waiting for players to join…</div>
 
     <button class="btn-primary hidden" id="btn-start" style="max-width:280px;">Start Game</button>
+    <button class="exit-link" id="btn-exit-room">Exit Room</button>
   </div>
 
   <!-- ============ GAME TABLE VIEW ============ -->
+
   <div id="view-game" class="table-wrap hidden">
-    <div class="top-bar">
-      <div class="mendi-counter mine">
-        <div class="mendi-label">Your</div>
-        <div class="ten-slots" id="my-ten-slots"></div>
-      </div>
-
-      <div class="trump-badge">
-        <div class="trump-card-box" id="trump-symbol"></div>
-      </div>
-
-      <div class="mendi-counter theirs">
-        <div class="mendi-label">Opponent</div>
-        <div class="ten-slots" id="opp-ten-slots"></div>
-      </div>
-    </div>
-
+    <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
     <div class="table-felt">
-      <div class="seat-marker top" id="marker-top"><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker left" id="marker-left"><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker right" id="marker-right"><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker bottom-marker" id="marker-bottom"><div class="seat-mini-name">-</div></div>
+      <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+      <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+      <div class="seat-marker right" id="marker-right"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+      <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
 
-      <div class="trick-center" id="trick-center"></div>
+      <div class="center-stack">
+        <div class="scoreboard-row">
+          <div class="ten-slots" id="my-ten-slots"></div>
+          <div class="trump-card-box" id="trump-symbol">?</div>
+          <div class="ten-slots" id="opp-ten-slots"></div>
+        </div>
+        <div class="trick-center" id="trick-center"></div>
+      </div>
     </div>
 
     <div class="hand-strip-wrap">
@@ -1587,6 +1813,16 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="confirm-overlay" id="confirm-overlay">
+  <div class="confirm-card">
+    <div class="confirm-text">Leave game? This will end it for everyone.</div>
+    <div class="confirm-buttons">
+      <button class="btn-secondary" id="btn-confirm-exit-cancel">Cancel</button>
+      <button class="btn-danger" id="btn-confirm-exit-yes">Leave</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1600,11 +1836,14 @@ INDEX_HTML = """<!DOCTYPE html>
     roomCode: null,
     mySeat: null,
     seats: {},          // seat -> {name, connected, team}
+    teamFull: { A: false, B: false },
     hostSeat: 0,
     gameState: null,    // latest game_state.state
     pendingReveal: false,
     selectedRevealCard: null,
-    view: 'home',
+    view: 'menu',
+    createTeam: null,
+    joinTeam: null,
     // Cards currently shown on the table, built up live from card_played
     // events. This is NOT the same as gameState.current_trick: the server
     // resolves a trick (clearing current_trick) the instant the 4th card is
@@ -1651,11 +1890,12 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   // ---------------- view switching ----------------
+  const ALL_VIEWS = ['menu', 'create', 'join', 'room', 'game'];
   function showView(name) {
     S.view = name;
-    document.getElementById('view-home').classList.toggle('hidden', name !== 'home');
-    document.getElementById('view-room').classList.toggle('hidden', name !== 'room');
-    document.getElementById('view-game').classList.toggle('hidden', name !== 'game');
+    ALL_VIEWS.forEach(v => {
+      document.getElementById('view-' + v).classList.toggle('hidden', v !== name);
+    });
   }
 
   function showToast(msg) {
@@ -1666,13 +1906,13 @@ INDEX_HTML = """<!DOCTYPE html>
     t._hideTimer = setTimeout(() => t.classList.remove('show'), 2600);
   }
 
-  function showError(msg) {
-    const el = document.getElementById('home-error');
+  function showError(bannerId, msg) {
+    const el = document.getElementById(bannerId);
     el.textContent = msg;
     el.classList.add('show');
   }
-  function clearError() {
-    document.getElementById('home-error').classList.remove('show');
+  function clearError(bannerId) {
+    document.getElementById(bannerId).classList.remove('show');
   }
 
   // ---------------- websocket ----------------
@@ -1709,11 +1949,12 @@ INDEX_HTML = """<!DOCTYPE html>
         S.mySeat = msg.your_seat;
         saveSession(S.playerId, S.roomCode);
         document.getElementById('room-code-text').textContent = S.roomCode;
-        if (S.view === 'home') showView('room');
+        if (S.view === 'create' || S.view === 'join' || S.view === 'menu') showView('room');
         break;
 
       case 'room_update':
         S.seats = msg.seats;
+        S.teamFull = msg.team_full || { A: false, B: false };
         S.hostSeat = msg.host_seat;
         renderLobby(msg);
         if (msg.game_in_progress && S.view !== 'game') {
@@ -1774,28 +2015,82 @@ INDEX_HTML = """<!DOCTYPE html>
         showResultOverlay(msg.winner_team, msg.final_mendi);
         break;
 
+      case 'room_cancelled':
+        handleRoomCancelled(msg);
+        break;
+
       case 'error':
-        showToast(msg.message);
-        showError(msg.message);
+        const friendly = friendlyErrorMessage(msg.message);
+        showToast(friendly);
+        if (S.view === 'create') showError('create-error', friendly);
+        else if (S.view === 'join') showError('join-error', friendly);
         break;
     }
   }
 
-  // ---------------- home actions ----------------
-  document.getElementById('btn-create').addEventListener('click', () => {
-    clearError();
-    const name = document.getElementById('player-name').value.trim() || 'Host';
-    localStorage.setItem('mendikot_name', name);
-    send({ type: 'create_room', player_name: name });
+  function friendlyErrorMessage(code) {
+    const map = {
+      'ROOM_NOT_FOUND': 'Room not found. Check the code and try again.',
+      'ROOM_FULL': 'That room is already full.',
+      'TEAM_FULL': 'That team is already full \\u2014 try the other team.',
+    };
+    return map[code] || code;
+  }
+
+  function handleRoomCancelled(msg) {
+    clearSession();
+    const reasonText = 'A player left the game, so the room was closed.';
+    showToast(reasonText);
+    // Give the toast a beat to be visible before reloading back to the menu.
+    setTimeout(() => { location.reload(); }, 1800);
+  }
+
+  // ---------------- menu / navigation actions ----------------
+  document.getElementById('btn-goto-create').addEventListener('click', () => {
+    showView('create');
+  });
+  document.getElementById('btn-goto-join').addEventListener('click', () => {
+    showView('join');
+  });
+  document.getElementById('btn-create-back').addEventListener('click', () => {
+    showView('menu');
+  });
+  document.getElementById('btn-join-back').addEventListener('click', () => {
+    showView('menu');
   });
 
-  document.getElementById('btn-join').addEventListener('click', () => {
-    clearError();
-    const name = document.getElementById('player-name').value.trim() || 'Player';
-    const code = document.getElementById('join-code').value.trim().toUpperCase();
-    if (!code) { showError('Enter a room code'); return; }
+  // ---------------- team picker (shared logic for create + join screens) ----------------
+  function setupTeamPicker(pickerId, stateKey) {
+    const picker = document.getElementById(pickerId);
+    picker.querySelectorAll('.team-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.classList.contains('full')) return;
+        S[stateKey] = btn.dataset.team;
+        picker.querySelectorAll('.team-btn').forEach(b => b.classList.toggle('selected', b === btn));
+      });
+    });
+  }
+  setupTeamPicker('create-team-picker', 'createTeam');
+  setupTeamPicker('join-team-picker', 'joinTeam');
+
+  // ---------------- create room ----------------
+  document.getElementById('btn-create-confirm').addEventListener('click', () => {
+    clearError('create-error');
+    const name = document.getElementById('create-player-name').value.trim() || 'Host';
+    if (!S.createTeam) { showError('create-error', 'Choose a team'); return; }
     localStorage.setItem('mendikot_name', name);
-    send({ type: 'join_room', room_code: code, player_name: name, player_id: uuid() });
+    send({ type: 'create_room', player_name: name, team: S.createTeam });
+  });
+
+  // ---------------- join room ----------------
+  document.getElementById('btn-join-confirm').addEventListener('click', () => {
+    clearError('join-error');
+    const name = document.getElementById('join-player-name').value.trim() || 'Player';
+    const code = document.getElementById('join-code').value.trim().toUpperCase();
+    if (!code) { showError('join-error', 'Enter a room code'); return; }
+    if (!S.joinTeam) { showError('join-error', 'Choose a team'); return; }
+    localStorage.setItem('mendikot_name', name);
+    send({ type: 'join_room', room_code: code, player_name: name, player_id: uuid(), team: S.joinTeam });
   });
 
   document.getElementById('join-code').addEventListener('input', (e) => {
@@ -1817,6 +2112,23 @@ INDEX_HTML = """<!DOCTYPE html>
   });
 
   document.getElementById('btn-leave').addEventListener('click', () => {
+    clearSession();
+    location.reload();
+  });
+
+  // ---------------- exit game/room (cancels for everyone) ----------------
+  function showConfirmExit() {
+    document.getElementById('confirm-overlay').classList.add('show');
+  }
+  function hideConfirmExit() {
+    document.getElementById('confirm-overlay').classList.remove('show');
+  }
+  document.getElementById('btn-exit-room').addEventListener('click', showConfirmExit);
+  document.getElementById('btn-exit-game').addEventListener('click', showConfirmExit);
+  document.getElementById('btn-confirm-exit-cancel').addEventListener('click', hideConfirmExit);
+  document.getElementById('btn-confirm-exit-yes').addEventListener('click', () => {
+    send({ type: 'exit_game' });
+    hideConfirmExit();
     clearSession();
     location.reload();
   });
@@ -1903,14 +2215,14 @@ INDEX_HTML = """<!DOCTYPE html>
     renderTenSlots('my-ten-slots', mineSuits, 'mine');
     renderTenSlots('opp-ten-slots', theirsSuits, 'theirs');
 
-    // trump badge - mini card shape, symbol only, no text
+    // trump card: "?" before reveal, suit symbol only after reveal
     const trumpBox = document.getElementById('trump-symbol');
     if (st.trump_suit) {
       trumpBox.className = 'trump-card-box revealed ' + (RED_SUITS.has(st.trump_suit) ? 'red' : 'black');
       trumpBox.textContent = SUIT_SYMBOL[st.trump_suit];
     } else {
       trumpBox.className = 'trump-card-box';
-      trumpBox.textContent = '';
+      trumpBox.textContent = '?';
     }
 
     // seat markers (relative to me: bottom = me, then left/top/right going clockwise from my left)
@@ -2034,9 +2346,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const isWon = wonSet.has(suit);
       const color = RED_SUITS.has(suit) ? 'red' : 'black';
       slot.className = 'ten-slot' + (isWon ? ' won ' + color + ' ' + kind : '');
-      slot.innerHTML =
-        '<div class="ts-rank">10</div>' +
-        '<div class="ts-suit">' + SUIT_SYMBOL[suit] + '</div>';
+      slot.innerHTML = '<div class="ts-suit">' + SUIT_SYMBOL[suit] + '</div>';
       el.appendChild(slot);
     });
   }
@@ -2066,7 +2376,7 @@ INDEX_HTML = """<!DOCTYPE html>
     const seatInfo = S.seats[String(seat)] || { name: 'Seat ' + seat };
     const who = seat === S.mySeat ? 'You' : seatInfo.name;
     let msg = who + ' revealed trump: ' + fullSuitName(trumpSuit);
-    if (phase2Dealt) msg += ' \u2014 remaining cards dealt';
+    if (phase2Dealt) msg += ' \\u2014 remaining cards dealt';
     showToast(msg);
   }
   function fullSuitName(s) {
