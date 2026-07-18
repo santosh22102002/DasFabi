@@ -802,12 +802,13 @@ INDEX_HTML = """<!DOCTYPE html>
 
   body {
     margin: 0;
-    min-height: 100vh;
+    height: 100vh;
+    height: 100dvh;
     background:
       radial-gradient(ellipse at top, #431828 0%, var(--bg-deep) 65%);
     font-family: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
     color: var(--cream);
-    overflow-x: hidden;
+    overflow: hidden;
   }
 
   .display {
@@ -832,9 +833,19 @@ INDEX_HTML = """<!DOCTYPE html>
   #app {
     position: relative;
     z-index: 1;
-    min-height: 100vh;
+    height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Home and room/lobby views are short enough to allow scrolling if a very
+     small device ever needs it (e.g. landscape phone with keyboard open) -
+     only the game view has a hard no-scroll requirement. */
+  #view-home, #view-room {
+    overflow-y: auto;
+    min-height: 0;
   }
 
   /* ---------------- LOBBY / HOME ---------------- */
@@ -1067,15 +1078,18 @@ INDEX_HTML = """<!DOCTYPE html>
     max-width: 520px;
     width: 100%;
     margin: 0 auto;
-    padding: 12px 12px 16px;
+    padding: clamp(6px, 2vh, 12px) 12px clamp(8px, 2vh, 16px);
+    min-height: 0;
+    overflow: hidden;
   }
 
   .top-bar {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 8px 4px 14px;
+    padding: 4px 4px clamp(6px, 1.5vh, 14px);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    flex-shrink: 0;
   }
 
   .mendi-counter {
@@ -1161,15 +1175,15 @@ INDEX_HTML = """<!DOCTYPE html>
     border-radius: 12px;
     border: 1px solid var(--line);
     position: relative;
-    min-height: 340px;
+    min-height: 0;
     display: grid;
     grid-template-areas:
       ".    top    ."
       "left center right"
       ".    bottom .";
-    grid-template-columns: 70px 1fr 70px;
-    grid-template-rows: 70px 1fr 70px;
-    padding: 10px;
+    grid-template-columns: clamp(48px, 15vw, 70px) 1fr clamp(48px, 15vw, 70px);
+    grid-template-rows: clamp(48px, 12vh, 70px) 1fr clamp(48px, 12vh, 70px);
+    padding: clamp(6px, 1.5vw, 10px);
     gap: 4px;
   }
 
@@ -1213,8 +1227,8 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .trick-slot {
     position: absolute;
-    width: 46px;
-    height: 64px;
+    width: clamp(38px, 9vw, 46px);
+    height: clamp(53px, 12.5vw, 64px);
   }
   .trick-slot.pos-top { top: 0; left: 50%; transform: translateX(-50%); }
   .trick-slot.pos-left { left: 0; top: 50%; transform: translateY(-50%); }
@@ -1231,8 +1245,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
   /* playing card */
   .pcard {
-    width: 46px;
-    height: 64px;
+    width: clamp(38px, 9vw, 46px);
+    height: clamp(53px, 12.5vw, 64px);
     background: var(--cream);
     border-radius: 5px;
     box-shadow: 0 3px 8px rgba(0,0,0,0.4);
@@ -1273,15 +1287,16 @@ INDEX_HTML = """<!DOCTYPE html>
 
   /* hand strip */
   .hand-strip-wrap {
-    margin-top: 14px;
-    padding: 10px 4px 4px;
+    margin-top: clamp(4px, 1.5vh, 14px);
+    padding: clamp(4px, 1vh, 10px) 4px 4px;
+    flex-shrink: 0;
   }
   .turn-indicator {
     text-align: center;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     font-size: 13px;
     color: var(--gold-bright);
-    margin-bottom: 10px;
+    margin-bottom: clamp(4px, 1vh, 10px);
     min-height: 18px;
     letter-spacing: 0.3px;
   }
@@ -1290,13 +1305,16 @@ INDEX_HTML = """<!DOCTYPE html>
   .hand-strip {
     display: flex;
     justify-content: center;
-    gap: -8px;
-    flex-wrap: wrap;
-    padding-bottom: 6px;
+    flex-wrap: nowrap;
+    padding: 2px 8px 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
   }
   .hand-card {
-    width: 58px;
-    height: 82px;
+    width: clamp(38px, 9vw, 58px);
+    height: clamp(54px, 12.8vw, 82px);
     background: var(--cream);
     border-radius: 6px;
     box-shadow: 0 4px 10px rgba(0,0,0,0.45);
@@ -1308,7 +1326,7 @@ INDEX_HTML = """<!DOCTYPE html>
     font-weight: 700;
     cursor: pointer;
     transition: transform 0.12s ease, box-shadow 0.12s ease;
-    margin-left: -14px;
+    margin-left: clamp(-12px, -3vw, -8px);
     position: relative;
   }
   .hand-card:first-child { margin-left: 0; }
@@ -1446,6 +1464,37 @@ INDEX_HTML = """<!DOCTYPE html>
   @media (max-width: 380px) {
     .home-title { font-size: 42px; }
     .room-code-display .code { font-size: 38px; letter-spacing: 7px; }
+  }
+
+  /* Short viewports (landscape phones, small windows): compress the felt
+     table's fixed-height gutters further and tighten vertical spacing so
+     the whole game view still fits without scrolling. */
+  @media (max-height: 620px) {
+    .table-felt {
+      grid-template-columns: clamp(38px, 12vw, 60px) 1fr clamp(38px, 12vw, 60px);
+      grid-template-rows: clamp(38px, 10vh, 56px) 1fr clamp(38px, 10vh, 56px);
+    }
+    .hand-card {
+      width: clamp(34px, 8vw, 50px);
+      height: clamp(48px, 11.4vw, 71px);
+    }
+    .top-bar { padding-bottom: 4px; }
+    .turn-indicator { margin-bottom: 4px; min-height: 14px; }
+    .hand-strip-wrap { margin-top: 2px; padding-top: 2px; }
+  }
+
+  @media (max-height: 520px) {
+    .ten-slot { width: 20px; height: 28px; }
+    .trump-card-box { width: 34px; height: 48px; font-size: 20px; }
+    .action-bar { min-height: 30px; padding: 3px 0 1px; }
+  }
+
+  /* Larger screens (tablets/desktop): keep the game table from feeling tiny
+     and lost in a wide viewport, while the overall layout stays centered
+     via table-wrap's max-width + margin auto. */
+  @media (min-width: 700px) {
+    .table-wrap { max-width: 560px; }
+    .hand-card { width: clamp(50px, 6vw, 66px); height: clamp(70px, 8.4vw, 92px); }
   }
 </style>
 </head>
