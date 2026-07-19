@@ -834,6 +834,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <title>Mendikot</title>
 <style>
   :root {
@@ -865,7 +866,7 @@ INDEX_HTML = """<!DOCTYPE html>
       linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
       linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
     background-size: 20px 20px, 20px 20px, 100px 100px, 100px 100px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     color: var(--cream);
     overflow: hidden;
     transition: background 0.2s ease;
@@ -876,11 +877,11 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .display {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
   }
   .ui {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   }
 
   /* doodle texture overlay */
@@ -951,7 +952,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .home-card + .home-card { margin-top: 4px; }
 
   .field-label {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1.5px;
@@ -968,7 +969,7 @@ INDEX_HTML = """<!DOCTYPE html>
     background: var(--bg-panel-2);
     color: var(--cream);
     font-size: 17px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     outline: none;
     margin-bottom: 16px;
     transition: border-color 0.2s ease, transform 0.15s ease;
@@ -978,10 +979,10 @@ INDEX_HTML = """<!DOCTYPE html>
     transform: scale(1.01) rotate(-0.5deg);
   }
   input[type=text]::placeholder { color: rgba(245,237,224,0.35); }
-  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Comic Sans MS', cursive; }
+  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 
   button {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     cursor: pointer;
     border: 2px solid rgba(255,255,255,0.3);
     border-radius: 5px 9px 4px 8px;
@@ -1032,7 +1033,7 @@ INDEX_HTML = """<!DOCTYPE html>
     background: none;
     border: none;
     color: rgba(245,237,224,0.55);
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px;
     align-self: flex-start;
     padding: 4px 0;
@@ -1053,7 +1054,7 @@ INDEX_HTML = """<!DOCTYPE html>
     border: 2px solid rgba(245,237,224,0.25);
     border-radius: 5px 10px 4px 8px;
     color: rgba(245,237,224,0.7);
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px;
     font-weight: 600;
     transition: all 0.2s ease;
@@ -1080,7 +1081,7 @@ INDEX_HTML = """<!DOCTYPE html>
     background: none;
     border: none;
     color: rgba(245,237,224,0.4);
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 13px;
     margin-top: 18px;
     padding: 6px;
@@ -1131,7 +1132,7 @@ INDEX_HTML = """<!DOCTYPE html>
     animation: sketchyAppear 0.4s ease;
   }
   .confirm-text {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 15px;
     color: var(--cream);
     margin-bottom: 20px;
@@ -1171,7 +1172,7 @@ INDEX_HTML = """<!DOCTYPE html>
     50% { transform: rotate(-90deg); }
   }
   .rotate-text {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 16px;
     color: var(--cream);
     max-width: 260px;
@@ -1186,7 +1187,7 @@ INDEX_HTML = """<!DOCTYPE html>
     padding: 10px 14px;
     border-radius: 4px 8px 5px 6px;
     font-size: 14px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     margin-bottom: 14px;
     display: none;
     animation: sketchyAppear 0.3s ease;
@@ -1209,7 +1210,7 @@ INDEX_HTML = """<!DOCTYPE html>
     animation: doodleBounce 0.5s ease;
   }
   .room-code-display .label {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 2px;
@@ -1228,7 +1229,7 @@ INDEX_HTML = """<!DOCTYPE html>
     animation: pencilDraw 0.6s ease;
   }
   .copy-hint {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 13px;
     color: rgba(245,237,224,0.5);
     margin-top: 10px;
@@ -1265,7 +1266,7 @@ INDEX_HTML = """<!DOCTYPE html>
     font-weight: 700;
   }
   .seat-slot .seat-team {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1285,7 +1286,7 @@ INDEX_HTML = """<!DOCTYPE html>
     50% { transform: scale(1.3); opacity: 0.7; }
   }
   .seat-slot .you-badge {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 9px;
     color: var(--gold);
     letter-spacing: 1px;
@@ -1293,7 +1294,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .waiting-note {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px;
     color: rgba(245,237,224,0.6);
     text-align: center;
@@ -1370,7 +1371,7 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 3px;
   }
   .score-side-label {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 9px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1391,7 +1392,7 @@ INDEX_HTML = """<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
     font-size: 8px;
     line-height: 1;
@@ -1427,7 +1428,7 @@ INDEX_HTML = """<!DOCTYPE html>
     font-size: clamp(16px, 4vw, 22px);
     background: rgba(0,0,0,0.16);
     color: rgba(245,237,224,0.3);
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
     flex-shrink: 0;
     border: 2px solid rgba(255,255,255,0.15);
@@ -1470,7 +1471,7 @@ INDEX_HTML = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     gap: 3px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   }
   .seat-marker .seat-mini-name {
     font-size: 12px;
@@ -1542,7 +1543,7 @@ INDEX_HTML = """<!DOCTYPE html>
     flex-direction: column;
     justify-content: space-between;
     padding: 3px 4px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
     position: relative;
     flex-shrink: 0;
@@ -1604,7 +1605,7 @@ INDEX_HTML = """<!DOCTYPE html>
     flex-direction: column;
     justify-content: space-between;
     padding: 5px 6px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
     cursor: pointer;
     transition: transform 0.18s ease, border-color 0.15s ease;
@@ -1661,7 +1662,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .reveal-btn:hover { transform: scale(1.05) rotate(-1deg); }
   .reveal-btn:active { transform: scale(0.97); }
   .reveal-prompt {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 13px;
     color: var(--gold-bright);
     margin-bottom: 8px;
@@ -1730,7 +1731,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .result-headline.draw { color: rgba(245,237,224,0.75); }
   .result-sub {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px;
     color: rgba(245,237,224,0.6);
     margin-bottom: 22px;
@@ -1748,7 +1749,7 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 8px;
   }
   .result-mendi-row .mendi-label {
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1772,7 +1773,7 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--cream);
     padding: 12px 20px;
     border-radius: 20px;
-    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
+    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 13px;
     z-index: 100;
     opacity: 0;
