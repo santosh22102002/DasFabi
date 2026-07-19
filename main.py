@@ -410,6 +410,7 @@ class Player:
     seat: int
     ws: Optional[WebSocket] = None
     connected: bool = True
+    is_bot: bool = False
 
 
 @dataclass
@@ -541,6 +542,154 @@ class RoomManager:
 
 
 
+"""Bot AI for solo mode."""
+
+BOT_NAMES = ["Bot Alpha", "Bot Beta", "Bot Gamma", "Bot Delta"]
+
+
+def _card_value(card: str) -> int:
+    return RANK_VALUE[card_rank(card)]
+
+
+def _choose_bot_move(hand: MendikotHand, seat: int) -> dict:
+    """
+    Decide what a bot should do on its turn.
+    Returns {"action": "play_card", "card": str} or {"action": "reveal_trump", "card": str}.
+    """
+    legal = hand.legal_moves(seat)
+    if not legal:
+        raise ValueError("Bot has no legal moves")
+
+    # Check if we MUST reveal trump (void in phase 1, no trump yet)
+    if (
+        hand.phase == Phase.PHASE1_PLAY
+        and hand.trump_suit is None
+        and hand.current_trick
+    ):
+        # Must reveal a trump card. Pick the LOWEST value card (conservative).
+        best = min(legal, key=_card_value)
+        return {"action": "reveal_trump", "card": best}
+
+    # Normal play: pick the LOWEST value legal card (conservative bot).
+    # But if leading, prefer not to lead a 10 (Mendi) unless forced.
+    is_leading = not hand.current_trick
+    if is_leading:
+        non_tens = [c for c in legal if card_rank(c) != "10"]
+        if non_tens:
+            best = min(non_tens, key=_card_value)
+        else:
+            best = min(legal, key=_card_value)
+    else:
+        best = min(legal, key=_card_value)
+
+    return {"action": "play_card", "card": best}
+
+
+async def process_bot_turns(room: Room):
+    """
+    After any state change, check if the current turn belongs to a bot.
+    If so, auto-play for it (with a small delay so humans can follow).
+    Loop until it's a human's turn or the hand ends.
+    """
+    h = room.hand
+    if h is None or h.phase == Phase.HAND_COMPLETE:
+        return
+
+    while True:
+        if room.cancelled or room.hand is None or room.hand.phase == Phase.HAND_COMPLETE:
+            break
+
+        turn = room.hand.turn_seat
+        player = room.players.get(turn)
+        if player is None or not player.is_bot:
+            break
+
+        # Wait if room is locked (trick pause)
+        while room.is_locked():
+            await asyncio.sleep(0.2)
+            if room.cancelled or room.hand is None:
+                return
+
+        # Small delay so the human can see the bot's move
+        await asyncio.sleep(0.6)
+
+        if room.cancelled or room.hand is None or room.hand.phase == Phase.HAND_COMPLETE:
+            break
+
+        h = room.hand
+        try:
+            move = _choose_bot_move(h, turn)
+        except ValueError:
+            break
+
+        if move["action"] == "reveal_trump":
+            try:
+                ev = h.reveal_trump(turn, move["card"])
+            except ValueError:
+                break
+            room.touch()
+            await broadcast(room, {
+                "type": "trump_revealed",
+                "seat": ev["seat"],
+                "card": ev["card"],
+                "trump_suit": ev["trump_suit"],
+            })
+            if "trick_result" in ev:
+                tr = ev["trick_result"]
+                await broadcast(room, {
+                    "type": "trick_won",
+                    "winner_seat": tr["winner_seat"],
+                    "mendi_count": tr["mendi_count"],
+                    "no_trump_locked": tr.get("no_trump_locked", False),
+                    "phase2_dealt": tr.get("phase2_dealt", False),
+                })
+                room.lock_for(TRICK_PAUSE_SECONDS)
+                await asyncio.sleep(TRICK_PAUSE_SECONDS)
+                await send_hand_state_to_all(room)
+                if tr.get("hand_complete"):
+                    await broadcast(room, {
+                        "type": "hand_complete",
+                        "winner_team": h.winner_team,
+                        "final_mendi": h.final_mendi,
+                    })
+                    break
+            else:
+                await send_hand_state_to_all(room)
+
+        else:  # play_card
+            try:
+                ev = h.play_card(turn, move["card"])
+            except ValueError:
+                break
+            room.touch()
+            await broadcast(room, {
+                "type": "card_played",
+                "seat": ev["seat"],
+                "card": ev["card"],
+            })
+            if "trick_result" in ev:
+                tr = ev["trick_result"]
+                await broadcast(room, {
+                    "type": "trick_won",
+                    "winner_seat": tr["winner_seat"],
+                    "mendi_count": tr["mendi_count"],
+                    "no_trump_locked": tr.get("no_trump_locked", False),
+                    "phase2_dealt": tr.get("phase2_dealt", False),
+                })
+                room.lock_for(TRICK_PAUSE_SECONDS)
+                await asyncio.sleep(TRICK_PAUSE_SECONDS)
+                await send_hand_state_to_all(room)
+                if tr.get("hand_complete"):
+                    await broadcast(room, {
+                        "type": "hand_complete",
+                        "winner_team": h.winner_team,
+                        "final_mendi": h.final_mendi,
+                    })
+                    break
+            else:
+                await send_hand_state_to_all(room)
+
+
 app = FastAPI()
 manager = RoomManager()
 
@@ -575,6 +724,7 @@ async def start_new_hand(room):
     room.hand = MendikotHand(dealer_seat=room.dealer_seat)
     await send_hand_state_to_all(room)
     await broadcast(room, {"type": "hand_started", "dealer_seat": room.dealer_seat})
+    asyncio.create_task(process_bot_turns(room))
 
 
 def rotate_dealer(room):
@@ -628,6 +778,41 @@ async def websocket_endpoint(ws: WebSocket):
                     "your_seat": seat,
                 })
                 await broadcast(room, room.lobby_state())
+
+            # ---------------- SOLO (vs bots) ----------------
+            elif mtype == "solo":
+                name = (msg.get("player_name") or "Player").strip()[:20] or "Player"
+                team = msg.get("team")
+                if team not in ("A", "B"):
+                    team = "A"
+                player_id = str(uuid.uuid4())
+                room, player = manager.create_room(name, player_id, team)
+                player.ws = ws
+                seat = player.seat
+
+                # Fill remaining seats with bots
+                bot_seats = [s for s in range(4) if s != seat]
+                for i, bot_seat in enumerate(bot_seats):
+                    bot = Player(
+                        player_id=f"bot_{room.code}_{bot_seat}",
+                        name=BOT_NAMES[i % len(BOT_NAMES)],
+                        seat=bot_seat,
+                        is_bot=True,
+                    )
+                    room.players[bot_seat] = bot
+
+                await send_json(ws, {
+                    "type": "joined",
+                    "room_code": room.code,
+                    "player_id": player_id,
+                    "your_seat": seat,
+                })
+                await broadcast(room, room.lobby_state())
+
+                # Auto-start game immediately
+                await start_new_hand(room)
+                # If first turn is a bot, process it
+                asyncio.create_task(process_bot_turns(room))
 
             # ---------------- JOIN ROOM ----------------
             elif mtype == "join_room":
@@ -730,8 +915,11 @@ async def websocket_endpoint(ws: WebSocket):
                             "winner_team": h.winner_team,
                             "final_mendi": h.final_mendi,
                         })
+                    else:
+                        asyncio.create_task(process_bot_turns(room))
                 else:
                     await send_hand_state_to_all(room)
+                    asyncio.create_task(process_bot_turns(room))
 
             # ---------------- REVEAL TRUMP ----------------
             elif mtype == "reveal_trump":
@@ -818,6 +1006,8 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 rotate_dealer(room)
                 await start_new_hand(room)
+                # In solo mode, trigger bot turns if it's a bot's turn
+                asyncio.create_task(process_bot_turns(room))
 
             else:
                 await send_json(ws, {"type": "error", "message": f"Unknown message type: {mtype}"})
@@ -834,7 +1024,13 @@ async def websocket_endpoint(ws: WebSocket):
         if room is not None and seat is not None:
             manager.mark_disconnected(room, seat)
             if not room.cancelled:
-                await broadcast(room, room.lobby_state())
+                # Check if this is a solo room (all other players are bots)
+                # If the human disconnected, cancel the room
+                human_count = sum(1 for p in room.players.values() if not p.is_bot)
+                if human_count == 0:
+                    manager.cancel_room(room.code)
+                else:
+                    await broadcast(room, room.lobby_state())
 
 
 async def gc_loop():
@@ -1858,8 +2054,25 @@ INDEX_HTML = """<!DOCTYPE html>
   <div id="view-menu" class="home-wrap">
     <h1 class="home-title">Mendikot<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
     <div class="menu-buttons">
-      <button class="btn-primary" id="btn-goto-create">Create Room</button>
-      <button class="btn-secondary" id="btn-goto-join">Join Room</button>
+      <button class="btn-primary" id="btn-goto-solo">Solo</button>
+      <button class="btn-secondary" id="btn-goto-create">Play with Friends</button>
+    </div>
+  </div>
+
+  <!-- ============ SOLO SCREEN ============ -->
+  <div id="view-solo" class="home-wrap hidden">
+    <button class="back-link" id="btn-solo-back">&larr; Back</button>
+    <h2 class="screen-title">Solo vs Bots</h2>
+    <div class="home-card">
+      <div class="error-banner" id="solo-error"></div>
+      <label class="field-label">Your name</label>
+      <input type="text" id="solo-player-name" placeholder="Enter your name" maxlength="20">
+      <label class="field-label">Choose your team</label>
+      <div class="team-picker" id="solo-team-picker">
+        <button class="team-btn team-a selected" data-team="A">Team A</button>
+        <button class="team-btn team-b" data-team="B">Team B</button>
+      </div>
+      <button class="btn-primary" id="btn-solo-start">Start Game</button>
     </div>
   </div>
 
@@ -2005,6 +2218,7 @@ INDEX_HTML = """<!DOCTYPE html>
     view: 'menu',
     createTeam: null,
     joinTeam: null,
+    soloTeam: 'A',
     // Cards currently shown on the table, built up live from card_played
     // events. This is NOT the same as gameState.current_trick: the server
     // resolves a trick (clearing current_trick) the instant the 4th card is
@@ -2052,7 +2266,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   // ---------------- view switching ----------------
-  const ALL_VIEWS = ['menu', 'create', 'join', 'room', 'game'];
+  const ALL_VIEWS = ['menu', 'solo', 'create', 'join', 'room', 'game'];
   function showView(name) {
     S.view = name;
     ALL_VIEWS.forEach(v => {
@@ -2223,11 +2437,17 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   // ---------------- menu / navigation actions ----------------
+  document.getElementById('btn-goto-solo').addEventListener('click', () => {
+    showView('solo');
+  });
   document.getElementById('btn-goto-create').addEventListener('click', () => {
     showView('create');
   });
   document.getElementById('btn-goto-join').addEventListener('click', () => {
     showView('join');
+  });
+  document.getElementById('btn-solo-back').addEventListener('click', () => {
+    showView('menu');
   });
   document.getElementById('btn-create-back').addEventListener('click', () => {
     showView('menu');
@@ -2247,8 +2467,18 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     });
   }
+  setupTeamPicker('solo-team-picker', 'soloTeam');
   setupTeamPicker('create-team-picker', 'createTeam');
   setupTeamPicker('join-team-picker', 'joinTeam');
+
+  // ---------------- solo start ----------------
+  document.getElementById('btn-solo-start').addEventListener('click', () => {
+    clearError('solo-error');
+    const name = document.getElementById('solo-player-name').value.trim() || 'Player';
+    const team = S.soloTeam || 'A';
+    localStorage.setItem('mendikot_name', name);
+    send({ type: 'solo', player_name: name, team: team });
+  });
 
   // ---------------- create room ----------------
   document.getElementById('btn-create-confirm').addEventListener('click', () => {
