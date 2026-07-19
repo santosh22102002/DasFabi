@@ -1653,32 +1653,25 @@ INDEX_HTML = """<!DOCTYPE html>
   .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
   .hand-card.disabled:hover { transform: none; }
   .hand-card.trump-marked { outline: 2px solid var(--gold); outline-offset: -2px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px) rotate(-2deg); }
+  .hand-card.selected-for-reveal {
+    outline: 3px solid var(--gold-bright);
+    outline-offset: -3px;
+    transform: translateY(-14px) scale(1.06) rotate(-1deg);
+    z-index: 10;
+    animation: cardSlipUp 0.25s cubic-bezier(.2,1.4,.4,1);
+  }
+  @keyframes cardSlipUp {
+    0% { transform: translateY(0) scale(1) rotate(0deg); }
+    60% { transform: translateY(-18px) scale(1.08) rotate(-2deg); }
+    100% { transform: translateY(-14px) scale(1.06) rotate(-1deg); }
+  }
 
   .action-bar {
     text-align: center;
     padding: 6px 0 2px;
     min-height: 40px;
   }
-  .reveal-btn {
-    padding: 10px 22px;
-    background: linear-gradient(180deg, var(--gold-bright), var(--gold));
-    color: var(--ink);
-    border-radius: 20px;
-    font-size: 14px;
-    border: 2px solid rgba(255,255,255,0.4);
-    animation: sketchyAppear 0.3s ease;
-    transition: transform 0.15s ease;
-  }
-  .reveal-btn:hover { transform: scale(1.05) rotate(-1deg); }
-  .reveal-btn:active { transform: scale(0.97); }
-  .reveal-prompt {
-    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 13px;
-    color: var(--gold-bright);
-    margin-bottom: 8px;
-    animation: fadeIn 0.3s ease;
-  }
+
 
   /* trump reveal flash overlay */
   .trump-flash {
@@ -2455,19 +2448,9 @@ INDEX_HTML = """<!DOCTYPE html>
     // whose turn it is: communicated via the seat-marker glow/pulse-dot only
     // (see seat marker rendering below) - no separate text row.
 
-    // action bar (reveal confirm button only)
+    // action bar (empty during reveal — double-tap on card handles confirm)
     const actionBar = document.getElementById('action-bar');
     actionBar.innerHTML = '';
-    if (S.pendingReveal && st.turn_seat === mySeat && S.selectedRevealCard) {
-      const btn = document.createElement('button');
-      btn.className = 'reveal-btn';
-      btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
-      btn.onclick = () => {
-        send({ type: 'reveal_trump', card: S.selectedRevealCard });
-        S.selectedRevealCard = null;
-      };
-      actionBar.appendChild(btn);
-    }
 
     // hand strip
     const handStrip = document.getElementById('hand-strip');
