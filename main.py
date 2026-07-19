@@ -1818,21 +1818,7 @@ INDEX_HTML = """<!DOCTYPE html>
     transition: transform 0.18s ease, border-color 0.15s ease;
     position: relative;
     flex-shrink: 0;
-    animation: cardDealIn 0.4s cubic-bezier(.2,1.4,.4,1) backwards;
   }
-  .hand-card:nth-child(1) { animation-delay: 0.03s; }
-  .hand-card:nth-child(2) { animation-delay: 0.06s; }
-  .hand-card:nth-child(3) { animation-delay: 0.09s; }
-  .hand-card:nth-child(4) { animation-delay: 0.12s; }
-  .hand-card:nth-child(5) { animation-delay: 0.15s; }
-  .hand-card:nth-child(6) { animation-delay: 0.18s; }
-  .hand-card:nth-child(7) { animation-delay: 0.21s; }
-  .hand-card:nth-child(8) { animation-delay: 0.24s; }
-  .hand-card:nth-child(9) { animation-delay: 0.27s; }
-  .hand-card:nth-child(10) { animation-delay: 0.30s; }
-  .hand-card:nth-child(11) { animation-delay: 0.33s; }
-  .hand-card:nth-child(12) { animation-delay: 0.36s; }
-  .hand-card:nth-child(13) { animation-delay: 0.39s; }
   .hand-card.red { color: var(--red-suit); }
   .hand-card.black { color: var(--ink); }
   .hand-card .hc-rank { font-size: 16px; line-height: 1; }
