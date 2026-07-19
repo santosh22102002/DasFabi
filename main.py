@@ -1177,8 +1177,7 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--cream);
     max-width: 260px;
   }
-  body.in-game.is-portrait .rotate-prompt { display: flex; }
-  body.in-game.is-portrait .table-wrap { visibility: hidden; }
+  /* Game is now vertical-first; no portrait lock needed */
 
   .error-banner {
     background: rgba(252,129,129,0.2);
@@ -1316,21 +1315,21 @@ INDEX_HTML = """<!DOCTYPE html>
     position: relative;
   }
 
-  .game-landscape-layout {
+  .game-vertical-layout {
     flex: 1;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;
     gap: clamp(6px, 1.5vw, 14px);
     min-height: 0;
   }
 
-  .game-landscape-layout .table-felt {
-    flex: 1.35;
+  .game-vertical-layout .table-felt {
+    flex: 2;
     min-width: 0;
     min-height: 0;
   }
 
-  .game-landscape-layout .hand-strip-wrap {
+  .game-vertical-layout .hand-strip-wrap {
     flex: 1;
     min-width: 0;
     min-height: 0;
@@ -1339,10 +1338,20 @@ INDEX_HTML = """<!DOCTYPE html>
     margin-top: 0;
     padding: 4px;
   }
-  .game-landscape-layout .hand-strip {
+  .game-vertical-layout .hand-strip {
     flex: 1;
     min-height: 0;
-    align-content: center;
+    align-content: flex-start;
+  }
+
+  .score-cluster-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: clamp(8px, 2.5vw, 18px);
+    flex-shrink: 0;
+    padding: 4px 0 6px;
+    animation: fadeIn 0.3s ease;
   }
 
   .center-stack {
@@ -1356,13 +1365,7 @@ INDEX_HTML = """<!DOCTYPE html>
     width: 100%;
   }
 
-  .score-cluster {
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    gap: clamp(8px, 2.5vw, 18px);
-    flex-shrink: 0;
-  }
+
 
   .score-side {
     display: flex;
@@ -1915,7 +1918,21 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div id="view-game" class="table-wrap hidden">
     <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
-    <div class="game-landscape-layout">
+
+    <!-- Score cluster at very top -->
+    <div class="score-cluster-top">
+      <div class="score-side mine">
+        <div class="score-side-label">Your</div>
+        <div class="ten-slots" id="my-ten-slots"></div>
+      </div>
+      <div class="trump-card-box" id="trump-symbol">?</div>
+      <div class="score-side theirs">
+        <div class="score-side-label">Opponent</div>
+        <div class="ten-slots" id="opp-ten-slots"></div>
+      </div>
+    </div>
+
+    <div class="game-vertical-layout">
       <div class="table-felt">
         <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
         <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
@@ -1923,17 +1940,6 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
 
         <div class="center-stack">
-          <div class="score-cluster">
-            <div class="score-side mine">
-              <div class="score-side-label">Your</div>
-              <div class="ten-slots" id="my-ten-slots"></div>
-            </div>
-            <div class="trump-card-box" id="trump-symbol">?</div>
-            <div class="score-side theirs">
-              <div class="score-side-label">Opponent</div>
-              <div class="ten-slots" id="opp-ten-slots"></div>
-            </div>
-          </div>
           <div class="trick-center" id="trick-center"></div>
         </div>
       </div>
