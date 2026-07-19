@@ -2455,24 +2455,18 @@ INDEX_HTML = """<!DOCTYPE html>
     // whose turn it is: communicated via the seat-marker glow/pulse-dot only
     // (see seat marker rendering below) - no separate text row.
 
-    // action bar (reveal button / prompt)
+    // action bar (reveal confirm button only)
     const actionBar = document.getElementById('action-bar');
     actionBar.innerHTML = '';
-    if (S.pendingReveal && st.turn_seat === mySeat) {
-      const prompt = document.createElement('div');
-      prompt.className = 'reveal-prompt';
-      prompt.textContent = 'Tap a trump card in your hand, then confirm:';
-      actionBar.appendChild(prompt);
-      if (S.selectedRevealCard) {
-        const btn = document.createElement('button');
-        btn.className = 'reveal-btn';
-        btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
-        btn.onclick = () => {
-          send({ type: 'reveal_trump', card: S.selectedRevealCard });
-          S.selectedRevealCard = null;
-        };
-        actionBar.appendChild(btn);
-      }
+    if (S.pendingReveal && st.turn_seat === mySeat && S.selectedRevealCard) {
+      const btn = document.createElement('button');
+      btn.className = 'reveal-btn';
+      btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
+      btn.onclick = () => {
+        send({ type: 'reveal_trump', card: S.selectedRevealCard });
+        S.selectedRevealCard = null;
+      };
+      actionBar.appendChild(btn);
     }
 
     // hand strip
@@ -2487,16 +2481,20 @@ INDEX_HTML = """<!DOCTYPE html>
       let isPlayable = false;
 
       if (S.pendingReveal && myTurn) {
-        // during reveal, only trump-suit-eligible... actually any card that IS trump can be chosen
-        // (player picks which trump card to reveal - so only cards matching what WOULD become trump)
-        // Since trump suit isn't locked yet, any card can theoretically be revealed as the trump card;
-        // the suit of the revealed card becomes trump. All cards are technically selectable here,
-        // but only cards NOT matching led suit make sense (server enforces this).
+        // Double-tap to reveal: first tap selects (slips up), second tap confirms
         isPlayable = true;
-        if (card === S.selectedRevealCard) el.classList.add('selected-for-reveal');
+        const alreadySelected = card === S.selectedRevealCard;
+        if (alreadySelected) el.classList.add('selected-for-reveal');
         el.addEventListener('click', () => {
-          S.selectedRevealCard = card;
-          renderGame();
+          if (S.selectedRevealCard === card) {
+            // Second tap on same card → confirm reveal
+            send({ type: 'reveal_trump', card: card });
+            S.selectedRevealCard = null;
+          } else {
+            // First tap → select card (slip up)
+            S.selectedRevealCard = card;
+            renderGame();
+          }
         });
       } else if (myTurn) {
         isPlayable = legalSet.has(card);
