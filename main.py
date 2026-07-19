@@ -837,20 +837,19 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>Mendikot</title>
 <style>
   :root {
-    --bg-deep: #0B2318;
-    --bg-panel: #123526;
-    --bg-panel-2: #16412E;
-    --felt: #1B4D34;
-    --felt-light: #235E3F;
-    --table-bg: #164531;
-    --gold: #D4A24C;
-    --gold-bright: #E8BE6E;
-    --cream: #F5EDE0;
-    --ink: #1C1410;
-    --teal-bright: #5FCB9E;
-    --red-suit: #C0453A;
-    --line: rgba(212, 162, 76, 0.22);
-    --shadow: rgba(0, 0, 0, 0.5);
+    --bg-deep: #1e3a5f;
+    --bg-panel: #2a4d7a;
+    --bg-panel-2: #3b5f94;
+    --felt: #254670;
+    --felt-light: #355a85;
+    --table-bg: #1e3a5f;
+    --gold: #e2e8f0;
+    --gold-bright: #ffffff;
+    --cream: #e2e8f0;
+    --ink: #1a202c;
+    --teal-bright: #90cdf4;
+    --red-suit: #fc8181;
+    --line: rgba(255, 255, 255, 0.25);
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -859,36 +858,39 @@ INDEX_HTML = """<!DOCTYPE html>
     margin: 0;
     height: 100vh;
     height: 100dvh;
-    background:
-      radial-gradient(ellipse at top, #1E5638 0%, var(--bg-deep) 68%);
-    font-family: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+    background-color: #1e3a5f;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.07) 1px, transparent 1px),
+      linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+    background-size: 20px 20px, 20px 20px, 100px 100px, 100px 100px;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     color: var(--cream);
     overflow: hidden;
     transition: background 0.2s ease;
   }
 
-  /* Game screen: one flat background matching the table itself, no separate
-     radial-gradient page backdrop behind a bordered felt panel. */
   body.in-game {
     background: var(--table-bg);
   }
 
   .display {
-    font-family: 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-weight: 700;
   }
   .ui {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
   }
 
-  /* subtle block-print texture overlay */
+  /* doodle texture overlay */
   body::before {
     content: "";
     position: fixed;
     inset: 0;
     pointer-events: none;
     background-image:
-      repeating-linear-gradient(45deg, rgba(212,162,76,0.03) 0px, rgba(212,162,76,0.03) 1px, transparent 1px, transparent 14px);
+      repeating-linear-gradient(45deg, rgba(255,255,255,0.02) 0px, rgba(255,255,255,0.02) 1px, transparent 1px, transparent 14px);
     z-index: 0;
   }
 
@@ -902,9 +904,6 @@ INDEX_HTML = """<!DOCTYPE html>
     overflow: hidden;
   }
 
-  /* Menu, create/join, and room/lobby views are short enough to allow
-     scrolling if a very small device ever needs it (e.g. landscape phone
-     with keyboard open) - only the game view has a hard no-scroll requirement. */
   #view-menu, #view-create, #view-join, #view-room {
     overflow-y: auto;
     min-height: 0;
@@ -926,9 +925,9 @@ INDEX_HTML = """<!DOCTYPE html>
     font-size: 52px;
     letter-spacing: 1px;
     color: var(--gold-bright);
-    text-shadow: 0 2px 12px rgba(0,0,0,0.5);
     margin: 0;
     text-align: center;
+    animation: doodleBounce 0.8s cubic-bezier(.2,1.4,.4,1);
   }
   .home-title .stamp-suits {
     display: block;
@@ -941,18 +940,18 @@ INDEX_HTML = """<!DOCTYPE html>
 
   .home-card {
     background: var(--bg-panel);
-    border: 1px solid var(--line);
-    border-radius: 4px;
+    border: 2px solid var(--line);
+    border-radius: 4px 12px 6px 10px;
     padding: 28px;
     width: 100%;
     max-width: 380px;
-    box-shadow: 0 12px 32px var(--shadow);
+    animation: sketchyAppear 0.5s ease;
   }
 
   .home-card + .home-card { margin-top: 4px; }
 
   .field-label {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1.5px;
@@ -964,29 +963,33 @@ INDEX_HTML = """<!DOCTYPE html>
   input[type=text] {
     width: 100%;
     padding: 13px 14px;
-    border-radius: 3px;
-    border: 1px solid var(--line);
+    border-radius: 4px 8px 6px 3px;
+    border: 2px solid var(--line);
     background: var(--bg-panel-2);
     color: var(--cream);
     font-size: 17px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     outline: none;
     margin-bottom: 16px;
+    transition: border-color 0.2s ease, transform 0.15s ease;
   }
-  input[type=text]:focus { border-color: var(--gold); }
+  input[type=text]:focus { 
+    border-color: var(--gold); 
+    transform: scale(1.01) rotate(-0.5deg);
+  }
   input[type=text]::placeholder { color: rgba(245,237,224,0.35); }
-  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: Georgia, serif; }
+  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Comic Sans MS', cursive; }
 
   button {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     cursor: pointer;
-    border: none;
-    border-radius: 3px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 5px 9px 4px 8px;
     font-weight: 600;
     letter-spacing: 0.3px;
-    transition: transform 0.08s ease, filter 0.15s ease;
+    transition: transform 0.12s ease, filter 0.15s ease, background 0.2s ease;
   }
-  button:active { transform: scale(0.97); }
+  button:active { transform: scale(0.97) rotate(-1deg); }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .btn-primary {
@@ -995,18 +998,19 @@ INDEX_HTML = """<!DOCTYPE html>
     background: linear-gradient(180deg, var(--gold-bright), var(--gold));
     color: var(--ink);
     font-size: 16px;
+    border: 2px solid rgba(255,255,255,0.5);
   }
-  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-2px) rotate(0.5deg); }
 
   .btn-secondary {
     width: 100%;
     padding: 14px;
     background: transparent;
-    border: 1px solid var(--teal-bright);
+    border: 2px solid var(--teal-bright);
     color: var(--teal-bright);
     font-size: 16px;
   }
-  .btn-secondary:hover:not(:disabled) { background: rgba(63,139,126,0.12); }
+  .btn-secondary:hover:not(:disabled) { background: rgba(144,205,244,0.12); transform: translateY(-2px) rotate(-0.5deg); }
 
   .menu-buttons {
     display: flex;
@@ -1021,19 +1025,21 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--gold-bright);
     margin: 0 0 4px;
     text-align: center;
+    animation: doodleBounce 0.6s ease;
   }
 
   .back-link {
     background: none;
     border: none;
     color: rgba(245,237,224,0.55);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 14px;
     align-self: flex-start;
     padding: 4px 0;
     margin-bottom: 4px;
+    transition: color 0.2s ease, transform 0.15s ease;
   }
-  .back-link:hover { color: var(--cream); }
+  .back-link:hover { color: var(--cream); transform: translateX(-3px); }
 
   .team-picker {
     display: flex;
@@ -1044,25 +1050,25 @@ INDEX_HTML = """<!DOCTYPE html>
     flex: 1;
     padding: 14px 8px;
     background: rgba(245,237,224,0.04);
-    border: 1.5px solid rgba(245,237,224,0.18);
-    border-radius: 4px;
+    border: 2px solid rgba(245,237,224,0.25);
+    border-radius: 5px 10px 4px 8px;
     color: rgba(245,237,224,0.7);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 14px;
     font-weight: 600;
-    transition: all 0.15s ease;
+    transition: all 0.2s ease;
   }
   .team-btn.team-a.selected {
     border-color: var(--gold);
-    background: rgba(212,162,76,0.16);
+    background: rgba(226,232,240,0.16);
     color: var(--gold-bright);
-    box-shadow: 0 0 0 1px var(--gold) inset;
+    transform: rotate(-1deg) scale(1.02);
   }
   .team-btn.team-b.selected {
     border-color: var(--teal-bright);
-    background: rgba(95,203,158,0.14);
+    background: rgba(144,205,244,0.14);
     color: var(--teal-bright);
-    box-shadow: 0 0 0 1px var(--teal-bright) inset;
+    transform: rotate(1deg) scale(1.02);
   }
   .team-btn.full {
     opacity: 0.35;
@@ -1074,23 +1080,24 @@ INDEX_HTML = """<!DOCTYPE html>
     background: none;
     border: none;
     color: rgba(245,237,224,0.4);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 13px;
     margin-top: 18px;
     padding: 6px;
+    transition: color 0.2s ease, transform 0.15s ease;
   }
-  .exit-link:hover { color: var(--red-suit); }
+  .exit-link:hover { color: var(--red-suit); transform: scale(1.05); }
 
   .exit-icon-btn {
     position: absolute;
     top: 6px;
     right: 6px;
     z-index: 20;
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
-    background: rgba(0,0,0,0.28);
-    border: none;
+    background: rgba(255,255,255,0.1);
+    border: 2px solid rgba(255,255,255,0.2);
     color: rgba(245,237,224,0.6);
     font-size: 20px;
     line-height: 1;
@@ -1098,13 +1105,14 @@ INDEX_HTML = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     padding: 0;
+    transition: transform 0.15s ease, background 0.2s ease;
   }
-  .exit-icon-btn:hover { background: rgba(166,54,44,0.5); color: var(--cream); }
+  .exit-icon-btn:hover { background: rgba(252,129,129,0.3); color: var(--cream); transform: rotate(90deg); }
 
   .confirm-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(4,14,9,0.82);
+    background: rgba(10,20,35,0.85);
     display: none;
     align-items: center;
     justify-content: center;
@@ -1114,15 +1122,16 @@ INDEX_HTML = """<!DOCTYPE html>
   .confirm-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
   .confirm-card {
     background: var(--bg-panel);
-    border-radius: 8px;
+    border: 2px solid var(--line);
+    border-radius: 6px 14px 8px 10px;
     padding: 28px 24px;
     max-width: 320px;
     width: 100%;
     text-align: center;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    animation: sketchyAppear 0.4s ease;
   }
   .confirm-text {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 15px;
     color: var(--cream);
     margin-bottom: 20px;
@@ -1136,6 +1145,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .btn-danger {
     background: var(--red-suit);
     color: var(--cream);
+    border: 2px solid rgba(255,255,255,0.3);
   }
 
   .rotate-prompt {
@@ -1161,27 +1171,25 @@ INDEX_HTML = """<!DOCTYPE html>
     50% { transform: rotate(-90deg); }
   }
   .rotate-text {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 16px;
     color: var(--cream);
     max-width: 260px;
   }
-  /* Only ever show the rotate prompt while a game is actually active AND the
-     viewport is portrait. body.in-game is toggled by JS whenever view-game
-     becomes the active screen. */
   body.in-game.is-portrait .rotate-prompt { display: flex; }
   body.in-game.is-portrait .table-wrap { visibility: hidden; }
 
   .error-banner {
-    background: rgba(166,54,44,0.25);
-    border: 1px solid var(--red-suit);
+    background: rgba(252,129,129,0.2);
+    border: 2px solid var(--red-suit);
     color: #FFD9D4;
     padding: 10px 14px;
-    border-radius: 3px;
+    border-radius: 4px 8px 5px 6px;
     font-size: 14px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     margin-bottom: 14px;
     display: none;
+    animation: sketchyAppear 0.3s ease;
   }
   .error-banner.show { display: block; }
 
@@ -1198,9 +1206,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
   .room-code-display {
     text-align: center;
+    animation: doodleBounce 0.5s ease;
   }
   .room-code-display .label {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 2px;
@@ -1212,19 +1221,21 @@ INDEX_HTML = """<!DOCTYPE html>
     letter-spacing: 10px;
     color: var(--gold-bright);
     background: var(--bg-panel);
-    border: 1px solid var(--line);
+    border: 2px solid var(--line);
+    border-radius: 5px 10px 6px 8px;
     padding: 14px 20px 14px 30px;
-    border-radius: 4px;
     display: inline-block;
+    animation: pencilDraw 0.6s ease;
   }
   .copy-hint {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 13px;
     color: rgba(245,237,224,0.5);
     margin-top: 10px;
     cursor: pointer;
+    transition: color 0.2s ease, transform 0.15s ease;
   }
-  .copy-hint:hover { color: var(--gold); }
+  .copy-hint:hover { color: var(--gold); transform: scale(1.05); }
 
   .seats-grid {
     display: grid;
@@ -1235,12 +1246,17 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .seat-slot {
     background: var(--bg-panel);
-    border: 1px solid var(--line);
-    border-radius: 4px;
+    border: 2px solid var(--line);
+    border-radius: 5px 10px 4px 8px;
     padding: 16px;
     text-align: center;
     position: relative;
+    animation: sketchyAppear 0.4s ease backwards;
   }
+  .seat-slot:nth-child(1) { animation-delay: 0.05s; }
+  .seat-slot:nth-child(2) { animation-delay: 0.10s; }
+  .seat-slot:nth-child(3) { animation-delay: 0.15s; }
+  .seat-slot:nth-child(4) { animation-delay: 0.20s; }
   .seat-slot.team-a { border-left: 3px solid var(--gold); }
   .seat-slot.team-b { border-left: 3px solid var(--teal-bright); }
   .seat-slot.empty { opacity: 0.4; border-style: dashed; }
@@ -1249,7 +1265,7 @@ INDEX_HTML = """<!DOCTYPE html>
     font-weight: 700;
   }
   .seat-slot .seat-team {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1261,10 +1277,15 @@ INDEX_HTML = """<!DOCTYPE html>
     top: 8px; right: 8px;
     width: 8px; height: 8px;
     border-radius: 50%;
-    background: #A6362C;
+    background: #fc8181;
+    animation: pulseBadge 1.5s ease-in-out infinite;
+  }
+  @keyframes pulseBadge {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.3); opacity: 0.7; }
   }
   .seat-slot .you-badge {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 9px;
     color: var(--gold);
     letter-spacing: 1px;
@@ -1272,10 +1293,11 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .waiting-note {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 14px;
     color: rgba(245,237,224,0.6);
     text-align: center;
+    animation: fadeIn 0.5s ease;
   }
 
   /* ---------------- GAME TABLE ---------------- */
@@ -1348,14 +1370,14 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 3px;
   }
   .score-side-label {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 9px;
     text-transform: uppercase;
     letter-spacing: 1px;
     color: rgba(245,237,224,0.5);
   }
-  .score-side.mine .score-side-label { color: rgba(232,190,110,0.75); }
-  .score-side.theirs .score-side-label { color: rgba(95,203,158,0.7); }
+  .score-side.mine .score-side-label { color: rgba(255,255,255,0.75); }
+  .score-side.theirs .score-side-label { color: rgba(144,205,244,0.7); }
 
   .ten-slots {
     display: flex;
@@ -1369,12 +1391,13 @@ INDEX_HTML = """<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    font-family: Georgia, 'Times New Roman', serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-weight: 700;
     font-size: 8px;
     line-height: 1;
     background: rgba(0,0,0,0.14);
     color: rgba(245,237,224,0.18);
+    border: 1px solid rgba(255,255,255,0.1);
     transition: transform 0.25s cubic-bezier(.2,1.4,.4,1), background 0.25s ease;
   }
   .ten-slot .ts-suit { font-size: clamp(10px, 2.6vw, 13px); line-height: 1; }
@@ -1382,6 +1405,7 @@ INDEX_HTML = """<!DOCTYPE html>
     background: var(--cream);
     transform: translateY(-2px) scale(1.05);
     animation: mendiWon 0.5s cubic-bezier(.2,1.4,.4,1);
+    border: 2px solid var(--gold-bright);
   }
   @keyframes mendiWon {
     0% { transform: translateY(6px) scale(0.6) rotate(-10deg); opacity: 0; }
@@ -1390,27 +1414,29 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .ten-slot.won.red { color: var(--red-suit); }
   .ten-slot.won.black { color: var(--ink); }
-  .ten-slot.won.mine { box-shadow: 0 2px 10px rgba(212,162,76,0.55); }
-  .ten-slot.won.theirs { box-shadow: 0 2px 10px rgba(95,203,158,0.5); }
+  .ten-slot.won.mine { border-color: var(--gold); }
+  .ten-slot.won.theirs { border-color: var(--teal-bright); }
 
   .trump-card-box {
     width: clamp(30px, 7.5vw, 40px);
     height: clamp(42px, 10.5vw, 56px);
-    border-radius: 5px;
+    border-radius: 5px 8px 4px 7px;
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: clamp(16px, 4vw, 22px);
     background: rgba(0,0,0,0.16);
     color: rgba(245,237,224,0.3);
-    font-family: Georgia, 'Times New Roman', serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-weight: 700;
     flex-shrink: 0;
+    border: 2px solid rgba(255,255,255,0.15);
     transition: transform 0.3s cubic-bezier(.2,1.4,.4,1), background 0.3s ease;
   }
   .trump-card-box.revealed {
     background: var(--cream);
     animation: trumpLockIn 0.5s cubic-bezier(.2,1.4,.4,1);
+    border: 2px solid var(--gold);
   }
   @keyframes trumpLockIn {
     0% { transform: scale(1.6) rotate(-6deg); opacity: 0.3; }
@@ -1419,14 +1445,12 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .trump-card-box.revealed.red { color: var(--red-suit); }
   .trump-card-box.revealed.black { color: var(--ink); }
-  .trump-card-box.revealed { box-shadow: 0 3px 12px rgba(212,162,76,0.45); }
 
   .table-felt {
     flex: 1;
     background: transparent;
     border-radius: 0;
     border: none;
-    box-shadow: none;
     position: relative;
     min-height: 0;
     display: grid;
@@ -1446,18 +1470,17 @@ INDEX_HTML = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     gap: 3px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
   }
   .seat-marker .seat-mini-name {
     font-size: 12px;
     font-weight: 600;
     color: rgba(245,237,224,0.75);
-    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
     white-space: nowrap;
     max-width: 92px;
     overflow: hidden;
     text-overflow: ellipsis;
-    transition: color 0.25s ease, text-shadow 0.25s ease;
+    transition: color 0.25s ease, transform 0.2s ease;
   }
   .seat-marker .turn-dot {
     width: 6px;
@@ -1467,11 +1490,11 @@ INDEX_HTML = """<!DOCTYPE html>
     opacity: 0;
     transform: scale(0.5);
     transition: opacity 0.25s ease, transform 0.25s ease;
-    box-shadow: 0 0 8px var(--gold-bright);
+    border: 1px solid rgba(255,255,255,0.5);
   }
   .seat-marker.active .seat-mini-name {
     color: var(--gold-bright);
-    text-shadow: 0 0 10px rgba(232,190,110,0.7), 0 1px 3px rgba(0,0,0,0.6);
+    transform: scale(1.05);
   }
   .seat-marker.active .turn-dot {
     opacity: 1;
@@ -1501,6 +1524,7 @@ INDEX_HTML = """<!DOCTYPE html>
     position: absolute;
     width: clamp(38px, 9vw, 46px);
     height: clamp(53px, 12.5vw, 64px);
+    animation: cardPopIn 0.35s cubic-bezier(.2,1.4,.4,1);
   }
   .trick-slot.pos-top { top: 0; left: 50%; transform: translateX(-50%); }
   .trick-slot.pos-left { left: 0; top: 50%; transform: translateY(-50%); }
@@ -1512,16 +1536,17 @@ INDEX_HTML = """<!DOCTYPE html>
     width: clamp(38px, 9vw, 46px);
     height: clamp(53px, 12.5vw, 64px);
     background: var(--cream);
-    border-radius: 5px;
-    box-shadow: 0 3px 8px rgba(0,0,0,0.4);
+    border-radius: 4px 6px 5px 7px;
+    border: 2px solid var(--ink);
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     padding: 3px 4px;
-    font-family: Georgia, 'Times New Roman', serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-weight: 700;
     position: relative;
     flex-shrink: 0;
+    animation: cardFlipIn 0.3s ease;
   }
   .pcard.red { color: var(--red-suit); }
   .pcard.black { color: var(--ink); }
@@ -1542,11 +1567,12 @@ INDEX_HTML = """<!DOCTYPE html>
     width: 7px; height: 7px;
     border-radius: 50%;
     background: var(--gold);
+    border: 1px solid var(--ink);
   }
 
   .pcard.face-down {
     background: repeating-linear-gradient(135deg, var(--bg-panel-2) 0 4px, var(--bg-panel) 4px 8px);
-    border: 1px solid var(--gold);
+    border: 2px solid var(--gold);
   }
 
   /* hand strip */
@@ -1572,19 +1598,33 @@ INDEX_HTML = """<!DOCTYPE html>
     width: clamp(44px, 8vw, 64px);
     height: clamp(62px, 11.3vw, 90px);
     background: var(--cream);
-    border-radius: 6px;
-    box-shadow: 0 3px 8px rgba(0,0,0,0.4);
+    border-radius: 5px 8px 4px 9px;
+    border: 2px solid var(--ink);
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     padding: 5px 6px;
-    font-family: Georgia, 'Times New Roman', serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-weight: 700;
     cursor: pointer;
-    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    transition: transform 0.18s ease, border-color 0.15s ease;
     position: relative;
     flex-shrink: 0;
+    animation: cardDealIn 0.4s cubic-bezier(.2,1.4,.4,1) backwards;
   }
+  .hand-card:nth-child(1) { animation-delay: 0.03s; }
+  .hand-card:nth-child(2) { animation-delay: 0.06s; }
+  .hand-card:nth-child(3) { animation-delay: 0.09s; }
+  .hand-card:nth-child(4) { animation-delay: 0.12s; }
+  .hand-card:nth-child(5) { animation-delay: 0.15s; }
+  .hand-card:nth-child(6) { animation-delay: 0.18s; }
+  .hand-card:nth-child(7) { animation-delay: 0.21s; }
+  .hand-card:nth-child(8) { animation-delay: 0.24s; }
+  .hand-card:nth-child(9) { animation-delay: 0.27s; }
+  .hand-card:nth-child(10) { animation-delay: 0.30s; }
+  .hand-card:nth-child(11) { animation-delay: 0.33s; }
+  .hand-card:nth-child(12) { animation-delay: 0.36s; }
+  .hand-card:nth-child(13) { animation-delay: 0.39s; }
   .hand-card.red { color: var(--red-suit); }
   .hand-card.black { color: var(--ink); }
   .hand-card .hc-rank { font-size: 16px; line-height: 1; }
@@ -1596,12 +1636,12 @@ INDEX_HTML = """<!DOCTYPE html>
     opacity: 0.85;
   }
   .hand-card .hc-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-  .hand-card:hover { transform: translateY(-6px); z-index: 5; }
-  .hand-card.playable:hover { transform: translateY(-8px); box-shadow: 0 8px 18px rgba(212,162,76,0.4); }
+  .hand-card:hover { transform: translateY(-6px) rotate(-1deg); z-index: 5; }
+  .hand-card.playable:hover { transform: translateY(-8px) rotate(1deg); border-color: var(--gold); }
   .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
   .hand-card.disabled:hover { transform: none; }
   .hand-card.trump-marked { outline: 2px solid var(--gold); outline-offset: -2px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px); }
+  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px) rotate(-2deg); }
 
   .action-bar {
     text-align: center;
@@ -1614,19 +1654,25 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--ink);
     border-radius: 20px;
     font-size: 14px;
+    border: 2px solid rgba(255,255,255,0.4);
+    animation: sketchyAppear 0.3s ease;
+    transition: transform 0.15s ease;
   }
+  .reveal-btn:hover { transform: scale(1.05) rotate(-1deg); }
+  .reveal-btn:active { transform: scale(0.97); }
   .reveal-prompt {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 13px;
     color: var(--gold-bright);
     margin-bottom: 8px;
+    animation: fadeIn 0.3s ease;
   }
 
   /* trump reveal flash overlay */
   .trump-flash {
     position: fixed;
     inset: 0;
-    background: rgba(43,14,23,0.75);
+    background: rgba(30,20,40,0.75);
     display: none;
     align-items: center;
     justify-content: center;
@@ -1636,14 +1682,14 @@ INDEX_HTML = """<!DOCTYPE html>
   .trump-flash .stamp {
     width: 130px;
     height: 182px;
-    border-radius: 12px;
+    border-radius: 8px 14px 10px 12px;
     background: var(--cream);
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 88px;
     animation: stampIn 0.4s cubic-bezier(.2,1.4,.4,1);
-    box-shadow: 0 0 60px rgba(212,162,76,0.5);
+    border: 3px solid var(--ink);
   }
   .trump-flash .stamp.red { color: var(--red-suit); }
   .trump-flash .stamp.black { color: var(--ink); }
@@ -1658,7 +1704,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .result-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(20,7,11,0.88);
+    background: rgba(15,25,45,0.9);
     display: none;
     align-items: center;
     justify-content: center;
@@ -1668,22 +1714,23 @@ INDEX_HTML = """<!DOCTYPE html>
   .result-overlay.show { display: flex; animation: fadeIn 0.25s ease; }
   .result-card {
     background: var(--bg-panel);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    border: 2px solid var(--line);
+    border-radius: 6px 14px 8px 10px;
     padding: 36px 30px;
     text-align: center;
     max-width: 340px;
     width: 100%;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    animation: sketchyAppear 0.5s ease;
   }
   .result-headline {
     font-size: 30px;
     color: var(--gold-bright);
     margin: 0 0 6px;
+    animation: doodleBounce 0.5s ease;
   }
   .result-headline.draw { color: rgba(245,237,224,0.75); }
   .result-sub {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 14px;
     color: rgba(245,237,224,0.6);
     margin-bottom: 22px;
@@ -1701,7 +1748,7 @@ INDEX_HTML = """<!DOCTYPE html>
     gap: 8px;
   }
   .result-mendi-row .mendi-label {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1721,30 +1768,61 @@ INDEX_HTML = """<!DOCTYPE html>
     left: 50%;
     transform: translateX(-50%);
     background: var(--bg-panel);
-    border: 1px solid var(--red-suit);
+    border: 2px solid var(--red-suit);
     color: var(--cream);
     padding: 12px 20px;
     border-radius: 20px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', 'Bradley Hand', cursive;
     font-size: 13px;
     z-index: 100;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s ease;
+    transition: opacity 0.2s ease, transform 0.3s ease;
   }
-  .toast.show { opacity: 1; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); animation: toastSlide 0.3s ease; }
+  @keyframes toastSlide {
+    from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+    to { transform: translateX(-50%) translateY(0); opacity: 1; }
+  }
 
   .hidden { display: none !important; }
+
+  /* ---- Animation keyframes ---- */
+  @keyframes cardDealIn {
+    0% { transform: translateY(-40px) rotate(-8deg) scale(0.7); opacity: 0; }
+    60% { transform: translateY(4px) rotate(2deg) scale(1.04); opacity: 1; }
+    100% { transform: translateY(0) rotate(0deg) scale(1); }
+  }
+  @keyframes cardPopIn {
+    0% { transform: scale(0.3) rotate(-15deg); opacity: 0; }
+    70% { transform: scale(1.08) rotate(3deg); opacity: 1; }
+    100% { transform: scale(1) rotate(0deg); opacity: 1; }
+  }
+  @keyframes cardFlipIn {
+    0% { transform: rotateY(90deg) scale(0.6); opacity: 0; }
+    100% { transform: rotateY(0deg) scale(1); opacity: 1; }
+  }
+  @keyframes sketchyAppear {
+    0% { transform: scale(0.9) rotate(-2deg); opacity: 0; }
+    50% { transform: scale(1.01) rotate(0.5deg); }
+    100% { transform: scale(1) rotate(0deg); opacity: 1; }
+  }
+  @keyframes doodleBounce {
+    0% { transform: translateY(-20px) scale(0.9); opacity: 0; }
+    50% { transform: translateY(4px) scale(1.02); }
+    70% { transform: translateY(-2px) scale(0.99); }
+    100% { transform: translateY(0) scale(1); opacity: 1; }
+  }
+  @keyframes pencilDraw {
+    0% { clip-path: inset(0 100% 0 0); opacity: 0; }
+    100% { clip-path: inset(0 0 0 0); opacity: 1; }
+  }
 
   @media (max-width: 380px) {
     .home-title { font-size: 42px; }
     .room-code-display .code { font-size: 38px; letter-spacing: 7px; }
   }
 
-  /* Short-height landscape phones: this is now the PRIMARY expected shape
-     for the game view (landscape-locked), so these rules cover the common
-     case, not an edge case - tighten gutters and compress the score cluster
-     to keep everything visible without scrolling. */
   @media (max-height: 420px) {
     .table-felt {
       grid-template-columns: clamp(34px, 10vw, 52px) 1fr clamp(34px, 10vw, 52px);
@@ -1762,9 +1840,6 @@ INDEX_HTML = """<!DOCTYPE html>
     .score-cluster { gap: 6px; }
   }
 
-  /* Larger screens (tablets/desktop): keep the game table from feeling tiny
-     and lost in a wide viewport, while the overall layout stays centered
-     via table-wrap's max-width + margin auto. */
   @media (min-width: 900px) {
     .table-wrap { max-width: 1100px; }
     .hand-card { width: clamp(50px, 6vw, 70px); height: clamp(70px, 8.4vw, 98px); }
@@ -1931,6 +2006,7 @@ INDEX_HTML = """<!DOCTYPE html>
     // displayedTrick is pushed to directly on every card_played, and only
     // cleared once the next game_state confirms a fresh trick has begun.
     displayedTrick: [],
+    lastTrickKey: '',   // to avoid re-animating trick cards on state refresh
   };
 
   const SUIT_SYMBOL = { S: '\\u2660', H: '\\u2665', D: '\\u2666', C: '\\u2663' };
@@ -2070,6 +2146,7 @@ INDEX_HTML = """<!DOCTYPE html>
         S.pendingReveal = false;
         S.selectedRevealCard = null;
         S.displayedTrick = [];
+        S.lastTrickKey = '';
         hideResultOverlay();
         break;
 
@@ -2335,6 +2412,12 @@ INDEX_HTML = """<!DOCTYPE html>
     // directly, since the server clears current_trick the instant a trick's
     // 4th card lands, before the 3s pause even starts.
     const center = document.getElementById('trick-center');
+    // Detect if this is a genuinely new trick state (new cards added) vs a
+    // re-render of the same trick (e.g. game_state arriving after card_played).
+    // Only animate when cards are actually new.
+    const currentTrickKey = S.displayedTrick.map(p => p.seat + '-' + p.card).sort().join('|');
+    const trickIsNew = S.lastTrickKey !== currentTrickKey;
+    S.lastTrickKey = currentTrickKey;
     center.innerHTML = '';
     if (S.displayedTrick && S.displayedTrick.length > 0) {
       const posOf = { };
@@ -2345,6 +2428,9 @@ INDEX_HTML = """<!DOCTYPE html>
       S.displayedTrick.forEach(play => {
         const slot = document.createElement('div');
         slot.className = 'trick-slot ' + posOf[play.seat];
+        if (!trickIsNew) {
+          slot.style.animation = 'none';
+        }
         const cardEl = makeCardEl(play.card, 'pcard', st.trump_suit);
         slot.appendChild(cardEl);
         center.appendChild(slot);
