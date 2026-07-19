@@ -785,7 +785,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
-<title>Mendikot</title>
+<title>Das Fabi</title>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -1572,7 +1572,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <div id="app">
 
   <div id="view-menu" class="home-wrap">
-    <h1 class="home-title">Mendikot<span class="stamp-suits">&#9824; &#9829; &#9830; &#9827;</span></h1>
+    <h1 class="home-title">ꯗ꯭ꯁ ꯐꯥꯕꯤ<span class="stamp-suits">&#9824; &#9829; &#9830; &#9827;</span></h1>
     <div class="menu-buttons">
       <button class="btn-primary" id="btn-solo">Solo</button>
       <button class="btn-secondary" id="btn-goto-hub">Play with Friends</button>
