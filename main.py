@@ -842,6 +842,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --bg-panel-2: #16412E;
     --felt: #1B4D34;
     --felt-light: #235E3F;
+    --table-bg: #164531;
     --gold: #D4A24C;
     --gold-bright: #E8BE6E;
     --cream: #F5EDE0;
@@ -863,6 +864,13 @@ INDEX_HTML = """<!DOCTYPE html>
     font-family: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
     color: var(--cream);
     overflow: hidden;
+    transition: background 0.2s ease;
+  }
+
+  /* Game screen: one flat background matching the table itself, no separate
+     radial-gradient page backdrop behind a bordered felt panel. */
+  body.in-game {
+    background: var(--table-bg);
   }
 
   .display {
@@ -1130,6 +1138,40 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--cream);
   }
 
+  .rotate-prompt {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: var(--table-bg);
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    text-align: center;
+    padding: 30px;
+  }
+  .rotate-icon {
+    font-size: 56px;
+    color: var(--gold-bright);
+    animation: rotateHint 1.8s ease-in-out infinite;
+  }
+  @keyframes rotateHint {
+    0%, 100% { transform: rotate(0deg); }
+    50% { transform: rotate(-90deg); }
+  }
+  .rotate-text {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 16px;
+    color: var(--cream);
+    max-width: 260px;
+  }
+  /* Only ever show the rotate prompt while a game is actually active AND the
+     viewport is portrait. body.in-game is toggled by JS whenever view-game
+     becomes the active screen. */
+  body.in-game.is-portrait .rotate-prompt { display: flex; }
+  body.in-game.is-portrait .table-wrap { visibility: hidden; }
+
   .error-banner {
     background: rgba(166,54,44,0.25);
     border: 1px solid var(--red-suit);
@@ -1242,12 +1284,42 @@ INDEX_HTML = """<!DOCTYPE html>
     flex: 1;
     display: flex;
     flex-direction: column;
-    max-width: 520px;
+    max-width: 900px;
     width: 100%;
     margin: 0 auto;
-    padding: clamp(6px, 2vh, 12px) 12px clamp(8px, 2vh, 16px);
+    padding: clamp(6px, 2vh, 10px);
     min-height: 0;
     overflow: hidden;
+    position: relative;
+  }
+
+  .game-landscape-layout {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    gap: clamp(6px, 1.5vw, 14px);
+    min-height: 0;
+  }
+
+  .game-landscape-layout .table-felt {
+    flex: 1.35;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .game-landscape-layout .hand-strip-wrap {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    margin-top: 0;
+    padding: 4px;
+  }
+  .game-landscape-layout .hand-strip {
+    flex: 1;
+    min-height: 0;
+    align-content: center;
   }
 
   .center-stack {
@@ -1261,13 +1333,29 @@ INDEX_HTML = """<!DOCTYPE html>
     width: 100%;
   }
 
-  .scoreboard-row {
+  .score-cluster {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     gap: clamp(8px, 2.5vw, 18px);
     flex-shrink: 0;
   }
+
+  .score-side {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+  }
+  .score-side-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: rgba(245,237,224,0.5);
+  }
+  .score-side.mine .score-side-label { color: rgba(232,190,110,0.75); }
+  .score-side.theirs .score-side-label { color: rgba(95,203,158,0.7); }
 
   .ten-slots {
     display: flex;
@@ -1335,13 +1423,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
   .table-felt {
     flex: 1;
-    background:
-      radial-gradient(ellipse at center, var(--felt-light) 0%, var(--felt) 55%, var(--bg-panel) 100%);
-    border-radius: 18px;
-    border: 1px solid rgba(212,162,76,0.15);
-    box-shadow:
-      inset 0 0 40px rgba(0,0,0,0.35),
-      inset 0 2px 0 rgba(255,255,255,0.04);
+    background: transparent;
+    border-radius: 0;
+    border: none;
+    box-shadow: none;
     position: relative;
     min-height: 0;
     display: grid;
@@ -1422,14 +1507,6 @@ INDEX_HTML = """<!DOCTYPE html>
   .trick-slot.pos-right { right: 0; top: 50%; transform: translateY(-50%); }
   .trick-slot.pos-bottom { bottom: 0; left: 50%; transform: translateX(-50%); }
 
-  .no-trump-tag {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 10px;
-    color: rgba(245,237,224,0.4);
-    text-transform: uppercase;
-    letter-spacing: 1px;
-  }
-
   /* playing card */
   .pcard {
     width: clamp(38px, 9vw, 46px);
@@ -1478,33 +1555,25 @@ INDEX_HTML = """<!DOCTYPE html>
     padding: clamp(4px, 1vh, 10px) 4px 4px;
     flex-shrink: 0;
   }
-  .turn-indicator {
-    text-align: center;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 13px;
-    color: var(--gold-bright);
-    margin-bottom: clamp(4px, 1vh, 10px);
-    min-height: 18px;
-    letter-spacing: 0.3px;
-  }
-  .turn-indicator.waiting { color: rgba(245,237,224,0.45); }
 
   .hand-strip {
     display: flex;
     justify-content: center;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    gap: clamp(4px, 1vw, 8px);
     padding: 2px 8px 8px;
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: thin;
   }
   .hand-card {
-    width: clamp(38px, 9vw, 58px);
-    height: clamp(54px, 12.8vw, 82px);
+    width: clamp(44px, 8vw, 64px);
+    height: clamp(62px, 11.3vw, 90px);
     background: var(--cream);
     border-radius: 6px;
-    box-shadow: 0 4px 10px rgba(0,0,0,0.45);
+    box-shadow: 0 3px 8px rgba(0,0,0,0.4);
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -1513,10 +1582,9 @@ INDEX_HTML = """<!DOCTYPE html>
     font-weight: 700;
     cursor: pointer;
     transition: transform 0.12s ease, box-shadow 0.12s ease;
-    margin-left: clamp(-12px, -3vw, -8px);
     position: relative;
+    flex-shrink: 0;
   }
-  .hand-card:first-child { margin-left: 0; }
   .hand-card.red { color: var(--red-suit); }
   .hand-card.black { color: var(--ink); }
   .hand-card .hc-rank { font-size: 16px; line-height: 1; }
@@ -1528,12 +1596,12 @@ INDEX_HTML = """<!DOCTYPE html>
     opacity: 0.85;
   }
   .hand-card .hc-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-  .hand-card:hover { transform: translateY(-10px); z-index: 5; }
-  .hand-card.playable:hover { transform: translateY(-14px); box-shadow: 0 8px 18px rgba(212,162,76,0.4); }
+  .hand-card:hover { transform: translateY(-6px); z-index: 5; }
+  .hand-card.playable:hover { transform: translateY(-8px); box-shadow: 0 8px 18px rgba(212,162,76,0.4); }
   .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
   .hand-card.disabled:hover { transform: none; }
   .hand-card.trump-marked { outline: 2px solid var(--gold); outline-offset: -2px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-10px); }
+  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px); }
 
   .action-bar {
     text-align: center;
@@ -1673,35 +1741,33 @@ INDEX_HTML = """<!DOCTYPE html>
     .room-code-display .code { font-size: 38px; letter-spacing: 7px; }
   }
 
-  /* Short viewports (landscape phones, small windows): compress the felt
-     table's fixed-height gutters further and tighten vertical spacing so
-     the whole game view still fits without scrolling. */
-  @media (max-height: 620px) {
+  /* Short-height landscape phones: this is now the PRIMARY expected shape
+     for the game view (landscape-locked), so these rules cover the common
+     case, not an edge case - tighten gutters and compress the score cluster
+     to keep everything visible without scrolling. */
+  @media (max-height: 420px) {
     .table-felt {
-      grid-template-columns: clamp(38px, 12vw, 60px) 1fr clamp(38px, 12vw, 60px);
-      grid-template-rows: clamp(38px, 10vh, 56px) 1fr clamp(38px, 10vh, 56px);
+      grid-template-columns: clamp(34px, 10vw, 52px) 1fr clamp(34px, 10vw, 52px);
+      grid-template-rows: clamp(34px, 14vh, 50px) 1fr clamp(34px, 14vh, 50px);
     }
-    .hand-card {
-      width: clamp(34px, 8vw, 50px);
-      height: clamp(48px, 11.4vw, 71px);
-    }
-    .top-bar { padding-bottom: 4px; }
-    .turn-indicator { margin-bottom: 4px; min-height: 14px; }
-    .hand-strip-wrap { margin-top: 2px; padding-top: 2px; }
+    .ten-slot { width: 15px; height: 21px; }
+    .trump-card-box { width: 26px; height: 36px; font-size: 14px; }
+    .score-side-label { font-size: 8px; }
+    .action-bar { min-height: 26px; padding: 2px 0; }
   }
 
-  @media (max-height: 520px) {
-    .ten-slot { width: 20px; height: 28px; }
-    .trump-card-box { width: 34px; height: 48px; font-size: 20px; }
-    .action-bar { min-height: 30px; padding: 3px 0 1px; }
+  @media (max-height: 340px) {
+    .ten-slot { width: 13px; height: 18px; }
+    .trump-card-box { width: 22px; height: 30px; font-size: 12px; }
+    .score-cluster { gap: 6px; }
   }
 
   /* Larger screens (tablets/desktop): keep the game table from feeling tiny
      and lost in a wide viewport, while the overall layout stays centered
      via table-wrap's max-width + margin auto. */
-  @media (min-width: 700px) {
-    .table-wrap { max-width: 560px; }
-    .hand-card { width: clamp(50px, 6vw, 66px); height: clamp(70px, 8.4vw, 92px); }
+  @media (min-width: 900px) {
+    .table-wrap { max-width: 1100px; }
+    .hand-card { width: clamp(50px, 6vw, 70px); height: clamp(70px, 8.4vw, 98px); }
   }
 </style>
 </head>
@@ -1773,29 +1839,41 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div id="view-game" class="table-wrap hidden">
     <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
-    <div class="table-felt">
-      <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker right" id="marker-right"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-      <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+    <div class="game-landscape-layout">
+      <div class="table-felt">
+        <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+        <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+        <div class="seat-marker right" id="marker-right"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
+        <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
 
-      <div class="center-stack">
-        <div class="scoreboard-row">
-          <div class="ten-slots" id="my-ten-slots"></div>
-          <div class="trump-card-box" id="trump-symbol">?</div>
-          <div class="ten-slots" id="opp-ten-slots"></div>
+        <div class="center-stack">
+          <div class="score-cluster">
+            <div class="score-side mine">
+              <div class="score-side-label">Your</div>
+              <div class="ten-slots" id="my-ten-slots"></div>
+            </div>
+            <div class="trump-card-box" id="trump-symbol">?</div>
+            <div class="score-side theirs">
+              <div class="score-side-label">Opponent</div>
+              <div class="ten-slots" id="opp-ten-slots"></div>
+            </div>
+          </div>
+          <div class="trick-center" id="trick-center"></div>
         </div>
-        <div class="trick-center" id="trick-center"></div>
       </div>
-    </div>
 
-    <div class="hand-strip-wrap">
-      <div class="turn-indicator" id="turn-indicator">-</div>
-      <div class="action-bar" id="action-bar"></div>
-      <div class="hand-strip" id="hand-strip"></div>
+      <div class="hand-strip-wrap">
+        <div class="action-bar" id="action-bar"></div>
+        <div class="hand-strip" id="hand-strip"></div>
+      </div>
     </div>
   </div>
 
+</div>
+
+<div class="rotate-prompt" id="rotate-prompt">
+  <div class="rotate-icon">&#8635;</div>
+  <div class="rotate-text">Rotate your device to play</div>
 </div>
 
 <div class="trump-flash" id="trump-flash">
@@ -1896,7 +1974,21 @@ INDEX_HTML = """<!DOCTYPE html>
     ALL_VIEWS.forEach(v => {
       document.getElementById('view-' + v).classList.toggle('hidden', v !== name);
     });
+    document.body.classList.toggle('in-game', name === 'game');
+    if (name === 'game') updateOrientationState();
   }
+
+  // ---------------- orientation / rotate-prompt ----------------
+  function updateOrientationState() {
+    const isPortrait = window.innerHeight > window.innerWidth;
+    document.body.classList.toggle('is-portrait', isPortrait);
+  }
+  window.addEventListener('resize', () => {
+    if (S.view === 'game') updateOrientationState();
+  });
+  window.addEventListener('orientationchange', () => {
+    if (S.view === 'game') setTimeout(updateOrientationState, 50);
+  });
 
   function showToast(msg) {
     const t = document.getElementById('toast');
@@ -2257,25 +2349,10 @@ INDEX_HTML = """<!DOCTYPE html>
         slot.appendChild(cardEl);
         center.appendChild(slot);
       });
-    } else if (st.phase === 'PHASE1_PLAY' && !st.trump_suit) {
-      const tag = document.createElement('div');
-      tag.className = 'no-trump-tag';
-      tag.textContent = 'Trump not yet revealed';
-      center.appendChild(tag);
     }
 
-    // turn indicator
-    const turnEl = document.getElementById('turn-indicator');
-    if (st.phase === 'HAND_COMPLETE') {
-      turnEl.textContent = '';
-    } else if (st.turn_seat === mySeat) {
-      turnEl.textContent = S.pendingReveal ? 'You must reveal a trump card' : 'Your turn';
-      turnEl.classList.remove('waiting');
-    } else {
-      const name = (S.seats[String(st.turn_seat)] || {}).name || ('Seat ' + st.turn_seat);
-      turnEl.textContent = name + '\\u2019s turn';
-      turnEl.classList.add('waiting');
-    }
+    // whose turn it is: communicated via the seat-marker glow/pulse-dot only
+    // (see seat marker rendering below) - no separate text row.
 
     // action bar (reveal button / prompt)
     const actionBar = document.getElementById('action-bar');
