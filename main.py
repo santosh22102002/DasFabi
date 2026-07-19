@@ -861,12 +861,12 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>Mendikot</title>
 <style>
   :root {
-    --bg-deep: #1e3a5f;
-    --bg-panel: #2a4d7a;
-    --bg-panel-2: #3b5f94;
-    --felt: #254670;
-    --felt-light: #355a85;
-    --table-bg: #1e3a5f;
+    --bg-deep: #35654d;
+    --bg-panel: #2a5039;
+    --bg-panel-2: #3d6b52;
+    --felt: #2d5a3e;
+    --felt-light: #3d7a52;
+    --table-bg: #35654d;
     --gold: #e2e8f0;
     --gold-bright: #ffffff;
     --cream: #e2e8f0;
@@ -882,7 +882,7 @@ INDEX_HTML = """<!DOCTYPE html>
     margin: 0;
     height: 100vh;
     height: 100dvh;
-    background: #1e3a5f;
+    background: #35654d;
     font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     color: var(--cream);
     overflow: hidden;
