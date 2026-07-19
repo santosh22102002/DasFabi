@@ -2662,21 +2662,15 @@ INDEX_HTML = """<!DOCTYPE html>
     // action bar
     const actionBar = document.getElementById('action-bar');
     actionBar.innerHTML = '';
-    if (S.pendingReveal && myTurn) {
-      const prompt = document.createElement('div');
-      prompt.className = 'reveal-prompt';
-      prompt.textContent = 'Tap a trump card in your hand, then confirm:';
-      actionBar.appendChild(prompt);
-      if (S.selectedRevealCard) {
-        const btn = document.createElement('button');
-        btn.className = 'reveal-btn';
-        btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
-        btn.onclick = () => {
-          send({ type: 'reveal_trump', card: S.selectedRevealCard });
-          S.selectedRevealCard = null;
-        };
-        actionBar.appendChild(btn);
-      }
+    if (S.pendingReveal && myTurn && S.selectedRevealCard) {
+      const btn = document.createElement('button');
+      btn.className = 'reveal-btn';
+      btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
+      btn.onclick = () => {
+        send({ type: 'reveal_trump', card: S.selectedRevealCard });
+        S.selectedRevealCard = null;
+      };
+      actionBar.appendChild(btn);
     }
 
     hand.forEach(card => {
