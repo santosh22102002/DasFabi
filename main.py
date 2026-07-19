@@ -2652,26 +2652,32 @@ INDEX_HTML = """<!DOCTYPE html>
     // whose turn it is: communicated via the seat-marker glow/pulse-dot only
     // (see seat marker rendering below) - no separate text row.
 
-    // action bar
-    const actionBar = document.getElementById('action-bar');
-    actionBar.innerHTML = '';
-    if (S.pendingReveal && myTurn && S.selectedRevealCard) {
-      const btn = document.createElement('button');
-      btn.className = 'reveal-btn';
-      btn.textContent = 'Confirm';
-      btn.onclick = () => {
-        send({ type: 'reveal_trump', card: S.selectedRevealCard });
-        S.selectedRevealCard = null;
-      };
-      actionBar.appendChild(btn);
-    }
-
     // hand strip
     const handStrip = document.getElementById('hand-strip');
     handStrip.innerHTML = '';
     const hand = st.your_hand || [];
     const myTurn = st.turn_seat === mySeat && st.phase !== 'HAND_COMPLETE';
     const legalSet = computeLegalMoves(st, hand);
+
+    // action bar
+    const actionBar = document.getElementById('action-bar');
+    actionBar.innerHTML = '';
+    if (S.pendingReveal && myTurn) {
+      const prompt = document.createElement('div');
+      prompt.className = 'reveal-prompt';
+      prompt.textContent = 'Tap a trump card in your hand, then confirm:';
+      actionBar.appendChild(prompt);
+      if (S.selectedRevealCard) {
+        const btn = document.createElement('button');
+        btn.className = 'reveal-btn';
+        btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
+        btn.onclick = () => {
+          send({ type: 'reveal_trump', card: S.selectedRevealCard });
+          S.selectedRevealCard = null;
+        };
+        actionBar.appendChild(btn);
+      }
+    }
 
     hand.forEach(card => {
       const el = makeCardEl(card, 'hand-card', st.trump_suit);
