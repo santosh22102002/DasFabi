@@ -1582,7 +1582,7 @@ INDEX_HTML = """<!DOCTYPE html>
   /* hand strip */
   .hand-strip-wrap {
     margin-top: clamp(4px, 1.5vh, 14px);
-    padding: clamp(4px, 1vh, 10px) 4px 4px;
+    padding: clamp(6px, 1.5vh, 12px) 4px 4px;
     flex-shrink: 0;
   }
 
@@ -1592,9 +1592,9 @@ INDEX_HTML = """<!DOCTYPE html>
     flex-wrap: wrap;
     align-content: flex-start;
     gap: clamp(4px, 1vw, 8px);
-    padding: 2px 8px 8px;
+    padding: 12px 8px 8px;
     overflow-y: auto;
-    overflow-x: hidden;
+    overflow-x: visible;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: thin;
   }
