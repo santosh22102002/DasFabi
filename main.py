@@ -2448,9 +2448,19 @@ INDEX_HTML = """<!DOCTYPE html>
     // whose turn it is: communicated via the seat-marker glow/pulse-dot only
     // (see seat marker rendering below) - no separate text row.
 
-    // action bar (empty during reveal — double-tap on card handles confirm)
+    // action bar
     const actionBar = document.getElementById('action-bar');
     actionBar.innerHTML = '';
+    if (S.pendingReveal && myTurn && S.selectedRevealCard) {
+      const btn = document.createElement('button');
+      btn.className = 'reveal-btn';
+      btn.textContent = 'Confirm';
+      btn.onclick = () => {
+        send({ type: 'reveal_trump', card: S.selectedRevealCard });
+        S.selectedRevealCard = null;
+      };
+      actionBar.appendChild(btn);
+    }
 
     // hand strip
     const handStrip = document.getElementById('hand-strip');
@@ -2464,20 +2474,12 @@ INDEX_HTML = """<!DOCTYPE html>
       let isPlayable = false;
 
       if (S.pendingReveal && myTurn) {
-        // Double-tap to reveal: first tap selects (slips up), second tap confirms
         isPlayable = true;
         const alreadySelected = card === S.selectedRevealCard;
         if (alreadySelected) el.classList.add('selected-for-reveal');
         el.addEventListener('click', () => {
-          if (S.selectedRevealCard === card) {
-            // Second tap on same card → confirm reveal
-            send({ type: 'reveal_trump', card: card });
-            S.selectedRevealCard = null;
-          } else {
-            // First tap → select card (slip up)
-            S.selectedRevealCard = card;
-            renderGame();
-          }
+          S.selectedRevealCard = card;
+          renderGame();
         });
       } else if (myTurn) {
         isPlayable = legalSet.has(card);
