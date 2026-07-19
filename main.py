@@ -524,6 +524,14 @@ class RoomManager:
             room.players[seat].connected = False
             room.players[seat].ws = None
 
+    def remove_player(self, room: Room, seat: int) -> bool:
+        """Remove a player from a room entirely (e.g. explicit lobby exit)."""
+        if seat in room.players:
+            del room.players[seat]
+            room.touch()
+            return True
+        return False
+
     def cancel_room(self, code: str):
         if code in self.rooms:
             del self.rooms[code]
@@ -773,12 +781,27 @@ async def websocket_endpoint(ws: WebSocket):
                     # need to play into it normally, no pause needed here.
                     await send_hand_state_to_all(room)
 
-            # ---------------- EXIT GAME (explicit, cancels room for everyone) ----------------
+            # ---------------- EXIT GAME ----------------
             elif mtype == "exit_game":
                 if room is None or seat is None:
                     await send_json(ws, {"type": "error", "message": "Not in a room"})
                     continue
-                await cancel_room_and_notify(room, seat, reason="player_left")
+
+                game_in_progress = room.hand is not None and room.hand.phase.value != "HAND_COMPLETE"
+
+                if game_in_progress:
+                    # During active play: any exit cancels the room for everyone
+                    await cancel_room_and_notify(room, seat, reason="player_left")
+                elif seat == 0:
+                    # In lobby: host leaving cancels the room
+                    await cancel_room_and_notify(room, seat, reason="host_left")
+                else:
+                    # In lobby: non-host leaves → just remove them, keep room open
+                    manager.remove_player(room, seat)
+                    await broadcast(room, room.lobby_state())
+                    # Notify the leaver they're out so their client cleans up
+                    await send_json(ws, {"type": "left_room", "reason": "you_left"})
+
                 room = None
                 seat = None
 
