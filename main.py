@@ -410,6 +410,7 @@ class Player:
     seat: int
     ws: Optional[WebSocket] = None
     connected: bool = True
+    is_bot: bool = False
 
 
 @dataclass
@@ -524,6 +525,14 @@ class RoomManager:
             room.players[seat].connected = False
             room.players[seat].ws = None
 
+    def remove_player(self, room: Room, seat: int) -> bool:
+        """Remove a player from a room entirely (e.g. explicit lobby exit)."""
+        if seat in room.players:
+            del room.players[seat]
+            room.touch()
+            return True
+        return False
+
     def cancel_room(self, code: str):
         if code in self.rooms:
             del self.rooms[code]
@@ -531,6 +540,154 @@ class RoomManager:
 
 """FastAPI WebSocket server for Mendikot. Orchestrates rooms + game engine."""
 
+
+
+"""Bot AI for solo mode."""
+
+BOT_NAMES = ["Bot Alpha", "Bot Beta", "Bot Gamma", "Bot Delta"]
+
+
+def _card_value(card: str) -> int:
+    return RANK_VALUE[card_rank(card)]
+
+
+def _choose_bot_move(hand: MendikotHand, seat: int) -> dict:
+    """
+    Decide what a bot should do on its turn.
+    Returns {"action": "play_card", "card": str} or {"action": "reveal_trump", "card": str}.
+    """
+    legal = hand.legal_moves(seat)
+    if not legal:
+        raise ValueError("Bot has no legal moves")
+
+    # Check if we MUST reveal trump (void in phase 1, no trump yet)
+    if (
+        hand.phase == Phase.PHASE1_PLAY
+        and hand.trump_suit is None
+        and hand.current_trick
+    ):
+        # Must reveal a trump card. Pick the LOWEST value card (conservative).
+        best = min(legal, key=_card_value)
+        return {"action": "reveal_trump", "card": best}
+
+    # Normal play: pick the LOWEST value legal card (conservative bot).
+    # But if leading, prefer not to lead a 10 (Mendi) unless forced.
+    is_leading = not hand.current_trick
+    if is_leading:
+        non_tens = [c for c in legal if card_rank(c) != "10"]
+        if non_tens:
+            best = min(non_tens, key=_card_value)
+        else:
+            best = min(legal, key=_card_value)
+    else:
+        best = min(legal, key=_card_value)
+
+    return {"action": "play_card", "card": best}
+
+
+async def process_bot_turns(room: Room):
+    """
+    After any state change, check if the current turn belongs to a bot.
+    If so, auto-play for it (with a small delay so humans can follow).
+    Loop until it's a human's turn or the hand ends.
+    """
+    h = room.hand
+    if h is None or h.phase == Phase.HAND_COMPLETE:
+        return
+
+    while True:
+        if room.cancelled or room.hand is None or room.hand.phase == Phase.HAND_COMPLETE:
+            break
+
+        turn = room.hand.turn_seat
+        player = room.players.get(turn)
+        if player is None or not player.is_bot:
+            break
+
+        # Wait if room is locked (trick pause)
+        while room.is_locked():
+            await asyncio.sleep(0.2)
+            if room.cancelled or room.hand is None:
+                return
+
+        # Small delay so the human can see the bot's move
+        await asyncio.sleep(0.6)
+
+        if room.cancelled or room.hand is None or room.hand.phase == Phase.HAND_COMPLETE:
+            break
+
+        h = room.hand
+        try:
+            move = _choose_bot_move(h, turn)
+        except ValueError:
+            break
+
+        if move["action"] == "reveal_trump":
+            try:
+                ev = h.reveal_trump(turn, move["card"])
+            except ValueError:
+                break
+            room.touch()
+            await broadcast(room, {
+                "type": "trump_revealed",
+                "seat": ev["seat"],
+                "card": ev["card"],
+                "trump_suit": ev["trump_suit"],
+            })
+            if "trick_result" in ev:
+                tr = ev["trick_result"]
+                await broadcast(room, {
+                    "type": "trick_won",
+                    "winner_seat": tr["winner_seat"],
+                    "mendi_count": tr["mendi_count"],
+                    "no_trump_locked": tr.get("no_trump_locked", False),
+                    "phase2_dealt": tr.get("phase2_dealt", False),
+                })
+                room.lock_for(TRICK_PAUSE_SECONDS)
+                await asyncio.sleep(TRICK_PAUSE_SECONDS)
+                await send_hand_state_to_all(room)
+                if tr.get("hand_complete"):
+                    await broadcast(room, {
+                        "type": "hand_complete",
+                        "winner_team": h.winner_team,
+                        "final_mendi": h.final_mendi,
+                    })
+                    break
+            else:
+                await send_hand_state_to_all(room)
+
+        else:  # play_card
+            try:
+                ev = h.play_card(turn, move["card"])
+            except ValueError:
+                break
+            room.touch()
+            await broadcast(room, {
+                "type": "card_played",
+                "seat": ev["seat"],
+                "card": ev["card"],
+            })
+            if "trick_result" in ev:
+                tr = ev["trick_result"]
+                await broadcast(room, {
+                    "type": "trick_won",
+                    "winner_seat": tr["winner_seat"],
+                    "mendi_count": tr["mendi_count"],
+                    "no_trump_locked": tr.get("no_trump_locked", False),
+                    "phase2_dealt": tr.get("phase2_dealt", False),
+                })
+                room.lock_for(TRICK_PAUSE_SECONDS)
+                await asyncio.sleep(TRICK_PAUSE_SECONDS)
+                await send_hand_state_to_all(room)
+                if tr.get("hand_complete"):
+                    await broadcast(room, {
+                        "type": "hand_complete",
+                        "winner_team": h.winner_team,
+                        "final_mendi": h.final_mendi,
+                    })
+                    break
+            else:
+                await send_hand_state_to_all(room)
 
 
 app = FastAPI()
@@ -567,6 +724,7 @@ async def start_new_hand(room):
     room.hand = MendikotHand(dealer_seat=room.dealer_seat)
     await send_hand_state_to_all(room)
     await broadcast(room, {"type": "hand_started", "dealer_seat": room.dealer_seat})
+    asyncio.create_task(process_bot_turns(room))
 
 
 def rotate_dealer(room):
@@ -620,6 +778,41 @@ async def websocket_endpoint(ws: WebSocket):
                     "your_seat": seat,
                 })
                 await broadcast(room, room.lobby_state())
+
+            # ---------------- SOLO (vs bots) ----------------
+            elif mtype == "solo":
+                name = (msg.get("player_name") or "Player").strip()[:20] or "Player"
+                team = msg.get("team")
+                if team not in ("A", "B"):
+                    team = random.choice(["A", "B"])
+                player_id = str(uuid.uuid4())
+                room, player = manager.create_room(name, player_id, team)
+                player.ws = ws
+                seat = player.seat
+
+                # Fill remaining seats with bots
+                bot_seats = [s for s in range(4) if s != seat]
+                for i, bot_seat in enumerate(bot_seats):
+                    bot = Player(
+                        player_id=f"bot_{room.code}_{bot_seat}",
+                        name=BOT_NAMES[i % len(BOT_NAMES)],
+                        seat=bot_seat,
+                        is_bot=True,
+                    )
+                    room.players[bot_seat] = bot
+
+                await send_json(ws, {
+                    "type": "joined",
+                    "room_code": room.code,
+                    "player_id": player_id,
+                    "your_seat": seat,
+                })
+                await broadcast(room, room.lobby_state())
+
+                # Auto-start game immediately
+                await start_new_hand(room)
+                # If first turn is a bot, process it
+                asyncio.create_task(process_bot_turns(room))
 
             # ---------------- JOIN ROOM ----------------
             elif mtype == "join_room":
@@ -722,8 +915,11 @@ async def websocket_endpoint(ws: WebSocket):
                             "winner_team": h.winner_team,
                             "final_mendi": h.final_mendi,
                         })
+                    else:
+                        asyncio.create_task(process_bot_turns(room))
                 else:
                     await send_hand_state_to_all(room)
+                    asyncio.create_task(process_bot_turns(room))
 
             # ---------------- REVEAL TRUMP ----------------
             elif mtype == "reveal_trump":
@@ -773,12 +969,27 @@ async def websocket_endpoint(ws: WebSocket):
                     # need to play into it normally, no pause needed here.
                     await send_hand_state_to_all(room)
 
-            # ---------------- EXIT GAME (explicit, cancels room for everyone) ----------------
+            # ---------------- EXIT GAME ----------------
             elif mtype == "exit_game":
                 if room is None or seat is None:
                     await send_json(ws, {"type": "error", "message": "Not in a room"})
                     continue
-                await cancel_room_and_notify(room, seat, reason="player_left")
+
+                game_in_progress = room.hand is not None and room.hand.phase.value != "HAND_COMPLETE"
+
+                if game_in_progress:
+                    # During active play: any exit cancels the room for everyone
+                    await cancel_room_and_notify(room, seat, reason="player_left")
+                elif seat == 0:
+                    # In lobby: host leaving cancels the room
+                    await cancel_room_and_notify(room, seat, reason="host_left")
+                else:
+                    # In lobby: non-host leaves → just remove them, keep room open
+                    manager.remove_player(room, seat)
+                    await broadcast(room, room.lobby_state())
+                    # Notify the leaver they're out so their client cleans up
+                    await send_json(ws, {"type": "left_room", "reason": "you_left"})
+
                 room = None
                 seat = None
 
@@ -795,6 +1006,8 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 rotate_dealer(room)
                 await start_new_hand(room)
+                # In solo mode, trigger bot turns if it's a bot's turn
+                asyncio.create_task(process_bot_turns(room))
 
             else:
                 await send_json(ws, {"type": "error", "message": f"Unknown message type: {mtype}"})
@@ -811,7 +1024,13 @@ async def websocket_endpoint(ws: WebSocket):
         if room is not None and seat is not None:
             manager.mark_disconnected(room, seat)
             if not room.cancelled:
-                await broadcast(room, room.lobby_state())
+                # Check if this is a solo room (all other players are bots)
+                # If the human disconnected, cancel the room
+                human_count = sum(1 for p in room.players.values() if not p.is_bot)
+                if human_count == 0:
+                    manager.cancel_room(room.code)
+                else:
+                    await broadcast(room, room.lobby_state())
 
 
 async def gc_loop():
@@ -834,6 +1053,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <title>Mendikot</title>
 <style>
   :root {
@@ -877,6 +1097,8 @@ INDEX_HTML = """<!DOCTYPE html>
     font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   }
 
+
+
   #app {
     position: relative;
     z-index: 1;
@@ -887,7 +1109,7 @@ INDEX_HTML = """<!DOCTYPE html>
     overflow: hidden;
   }
 
-  #view-menu, #view-create, #view-join, #view-room, #view-friends {
+  #view-menu, #view-create, #view-join, #view-room {
     overflow-y: auto;
     min-height: 0;
   }
@@ -961,7 +1183,7 @@ INDEX_HTML = """<!DOCTYPE html>
     transform: scale(1.01) rotate(-0.5deg);
   }
   input[type=text]::placeholder { color: rgba(245,237,224,0.35); }
-  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Open Sans', sans-serif; }
+  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 
   button {
     font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -1159,6 +1381,7 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--cream);
     max-width: 260px;
   }
+  /* Game is now vertical-first; no portrait lock needed */
 
   .error-banner {
     background: rgba(252,129,129,0.2);
@@ -1345,6 +1568,8 @@ INDEX_HTML = """<!DOCTYPE html>
     height: 100%;
     width: 100%;
   }
+
+
 
   .score-side {
     display: flex;
@@ -1610,25 +1835,25 @@ INDEX_HTML = """<!DOCTYPE html>
   .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
   .hand-card.disabled:hover { transform: none; }
   .hand-card.trump-marked { outline: 2px solid var(--gold); outline-offset: -2px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px) rotate(-2deg); }
+  .hand-card.selected-for-reveal {
+    outline: 3px solid var(--gold-bright);
+    outline-offset: -3px;
+    transform: translateY(-14px) scale(1.06) rotate(-1deg);
+    z-index: 10;
+    animation: cardSlipUp 0.25s cubic-bezier(.2,1.4,.4,1);
+  }
+  @keyframes cardSlipUp {
+    0% { transform: translateY(0) scale(1) rotate(0deg); }
+    60% { transform: translateY(-18px) scale(1.08) rotate(-2deg); }
+    100% { transform: translateY(-14px) scale(1.06) rotate(-1deg); }
+  }
 
   .action-bar {
     text-align: center;
     padding: 6px 0 2px;
     min-height: 40px;
   }
-  .reveal-btn {
-    padding: 10px 22px;
-    background: linear-gradient(180deg, var(--gold-bright), var(--gold));
-    color: var(--ink);
-    border-radius: 20px;
-    font-size: 14px;
-    border: 2px solid rgba(255,255,255,0.4);
-    animation: sketchyAppear 0.3s ease;
-    transition: transform 0.15s ease;
-  }
-  .reveal-btn:hover { transform: scale(1.05) rotate(-1deg); }
-  .reveal-btn:active { transform: scale(0.97); }
+
 
   /* trump reveal flash overlay */
   .trump-flash {
@@ -1815,8 +2040,18 @@ INDEX_HTML = """<!DOCTYPE html>
   <div id="view-menu" class="home-wrap">
     <h1 class="home-title">Mendikot<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
     <div class="menu-buttons">
-      <button class="btn-primary" id="btn-goto-create">Create Room</button>
-      <button class="btn-secondary" id="btn-goto-join">Join Room</button>
+      <button class="btn-primary" id="btn-goto-solo">Solo</button>
+      <button class="btn-secondary" id="btn-goto-friends">Play with Friends</button>
+    </div>
+  </div>
+
+  <!-- ============ PLAY WITH FRIENDS HUB ============ -->
+  <div id="view-friends" class="home-wrap hidden">
+    <button class="back-link" id="btn-friends-back">&larr; Back</button>
+    <h2 class="screen-title">Play with Friends</h2>
+    <div class="menu-buttons" style="max-width:380px;">
+      <button class="btn-primary" id="btn-goto-create-hub">Create Room</button>
+      <button class="btn-secondary" id="btn-goto-join-hub">Join Room</button>
     </div>
   </div>
 
@@ -1876,7 +2111,21 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div id="view-game" class="table-wrap hidden">
     <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
-    <div class="game-landscape-layout">
+
+    <!-- Score cluster at very top -->
+    <div class="score-cluster-top">
+      <div class="score-side mine">
+        <div class="score-side-label">Your</div>
+        <div class="ten-slots" id="my-ten-slots"></div>
+      </div>
+      <div class="trump-card-box" id="trump-symbol">?</div>
+      <div class="score-side theirs">
+        <div class="score-side-label">Opponent</div>
+        <div class="ten-slots" id="opp-ten-slots"></div>
+      </div>
+    </div>
+
+    <div class="game-vertical-layout">
       <div class="table-felt">
         <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
         <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
@@ -1884,17 +2133,6 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
 
         <div class="center-stack">
-          <div class="score-cluster">
-            <div class="score-side mine">
-              <div class="score-side-label">Your</div>
-              <div class="ten-slots" id="my-ten-slots"></div>
-            </div>
-            <div class="trump-card-box" id="trump-symbol">?</div>
-            <div class="score-side theirs">
-              <div class="score-side-label">Opponent</div>
-              <div class="ten-slots" id="opp-ten-slots"></div>
-            </div>
-          </div>
           <div class="trick-center" id="trick-center"></div>
         </div>
       </div>
@@ -1968,6 +2206,7 @@ INDEX_HTML = """<!DOCTYPE html>
     // displayedTrick is pushed to directly on every card_played, and only
     // cleared once the next game_state confirms a fresh trick has begun.
     displayedTrick: [],
+    lastTrickKey: '',   // to avoid re-animating trick cards on state refresh
   };
 
   const SUIT_SYMBOL = { S: '\\u2660', H: '\\u2665', D: '\\u2666', C: '\\u2663' };
@@ -2005,7 +2244,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   // ---------------- view switching ----------------
-  const ALL_VIEWS = ['menu', 'create', 'join', 'room', 'game'];
+  const ALL_VIEWS = ['menu', 'friends', 'create', 'join', 'room', 'game'];
   function showView(name) {
     S.view = name;
     ALL_VIEWS.forEach(v => {
@@ -2107,6 +2346,7 @@ INDEX_HTML = """<!DOCTYPE html>
         S.pendingReveal = false;
         S.selectedRevealCard = null;
         S.displayedTrick = [];
+        S.lastTrickKey = '';
         hideResultOverlay();
         break;
 
@@ -2175,17 +2415,29 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   // ---------------- menu / navigation actions ----------------
-  document.getElementById('btn-goto-create').addEventListener('click', () => {
+  document.getElementById('btn-goto-solo').addEventListener('click', () => {
+    // Instant solo game with random name
+    const randomName = 'Player ' + Math.floor(Math.random() * 9000 + 1000);
+    localStorage.setItem('mendikot_name', randomName);
+    send({ type: 'solo', player_name: randomName });
+  });
+  document.getElementById('btn-goto-friends').addEventListener('click', () => {
+    showView('friends');
+  });
+  document.getElementById('btn-goto-create-hub').addEventListener('click', () => {
     showView('create');
   });
-  document.getElementById('btn-goto-join').addEventListener('click', () => {
+  document.getElementById('btn-goto-join-hub').addEventListener('click', () => {
     showView('join');
   });
-  document.getElementById('btn-create-back').addEventListener('click', () => {
+  document.getElementById('btn-friends-back').addEventListener('click', () => {
     showView('menu');
   });
+  document.getElementById('btn-create-back').addEventListener('click', () => {
+    showView('friends');
+  });
   document.getElementById('btn-join-back').addEventListener('click', () => {
-    showView('menu');
+    showView('friends');
   });
 
   // ---------------- team picker (shared logic for create + join screens) ----------------
@@ -2372,6 +2624,12 @@ INDEX_HTML = """<!DOCTYPE html>
     // directly, since the server clears current_trick the instant a trick's
     // 4th card lands, before the 3s pause even starts.
     const center = document.getElementById('trick-center');
+    // Detect if this is a genuinely new trick state (new cards added) vs a
+    // re-render of the same trick (e.g. game_state arriving after card_played).
+    // Only animate when cards are actually new.
+    const currentTrickKey = S.displayedTrick.map(p => p.seat + '-' + p.card).sort().join('|');
+    const trickIsNew = S.lastTrickKey !== currentTrickKey;
+    S.lastTrickKey = currentTrickKey;
     center.innerHTML = '';
     if (S.displayedTrick && S.displayedTrick.length > 0) {
       const posOf = { };
@@ -2382,6 +2640,9 @@ INDEX_HTML = """<!DOCTYPE html>
       S.displayedTrick.forEach(play => {
         const slot = document.createElement('div');
         slot.className = 'trick-slot ' + posOf[play.seat];
+        if (!trickIsNew) {
+          slot.style.animation = 'none';
+        }
         const cardEl = makeCardEl(play.card, 'pcard', st.trump_suit);
         slot.appendChild(cardEl);
         center.appendChild(slot);
@@ -2391,26 +2652,6 @@ INDEX_HTML = """<!DOCTYPE html>
     // whose turn it is: communicated via the seat-marker glow/pulse-dot only
     // (see seat marker rendering below) - no separate text row.
 
-    // action bar (reveal button / prompt)
-    const actionBar = document.getElementById('action-bar');
-    actionBar.innerHTML = '';
-    if (S.pendingReveal && st.turn_seat === mySeat) {
-      const prompt = document.createElement('div');
-      prompt.className = 'reveal-prompt';
-      prompt.textContent = 'Tap a trump card in your hand, then confirm:';
-      actionBar.appendChild(prompt);
-      if (S.selectedRevealCard) {
-        const btn = document.createElement('button');
-        btn.className = 'reveal-btn';
-        btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
-        btn.onclick = () => {
-          send({ type: 'reveal_trump', card: S.selectedRevealCard });
-          S.selectedRevealCard = null;
-        };
-        actionBar.appendChild(btn);
-      }
-    }
-
     // hand strip
     const handStrip = document.getElementById('hand-strip');
     handStrip.innerHTML = '';
@@ -2418,18 +2659,28 @@ INDEX_HTML = """<!DOCTYPE html>
     const myTurn = st.turn_seat === mySeat && st.phase !== 'HAND_COMPLETE';
     const legalSet = computeLegalMoves(st, hand);
 
+    // action bar
+    const actionBar = document.getElementById('action-bar');
+    actionBar.innerHTML = '';
+    if (S.pendingReveal && myTurn && S.selectedRevealCard) {
+      const btn = document.createElement('button');
+      btn.className = 'reveal-btn';
+      btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
+      btn.onclick = () => {
+        send({ type: 'reveal_trump', card: S.selectedRevealCard });
+        S.selectedRevealCard = null;
+      };
+      actionBar.appendChild(btn);
+    }
+
     hand.forEach(card => {
       const el = makeCardEl(card, 'hand-card', st.trump_suit);
       let isPlayable = false;
 
       if (S.pendingReveal && myTurn) {
-        // during reveal, only trump-suit-eligible... actually any card that IS trump can be chosen
-        // (player picks which trump card to reveal - so only cards matching what WOULD become trump)
-        // Since trump suit isn't locked yet, any card can theoretically be revealed as the trump card;
-        // the suit of the revealed card becomes trump. All cards are technically selectable here,
-        // but only cards NOT matching led suit make sense (server enforces this).
         isPlayable = true;
-        if (card === S.selectedRevealCard) el.classList.add('selected-for-reveal');
+        const alreadySelected = card === S.selectedRevealCard;
+        if (alreadySelected) el.classList.add('selected-for-reveal');
         el.addEventListener('click', () => {
           S.selectedRevealCard = card;
           renderGame();
@@ -2486,6 +2737,7 @@ INDEX_HTML = """<!DOCTYPE html>
     symbolEl.className = 'stamp ' + (RED_SUITS.has(trumpSuit) ? 'red' : 'black');
     overlay.classList.add('show');
     setTimeout(() => overlay.classList.remove('show'), 1400);
+
   }
   function fullSuitName(s) {
     return { S: 'Spades', H: 'Hearts', D: 'Diamonds', C: 'Clubs' }[s];
