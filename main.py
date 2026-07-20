@@ -988,51 +988,44 @@ INDEX_HTML = """<!DOCTYPE html>
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
-  body {
+  html, body {
     margin: 0;
-    height: 100vh;
-    height: 100dvh;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
     background: #35654d;
     font-family: 'Open Sans', sans-serif;
     color: var(--cream);
-    overflow: hidden;
   }
 
   /* No shadows anywhere */
   * { box-shadow: none !important; }
 
-  .display { font-family: 'Open Sans', sans-serif; font-weight: 700; }
-  .ui { font-family: 'Open Sans', sans-serif; }
-
   #app {
-    position: relative;
-    z-index: 1;
-    height: 100vh;
-    height: 100dvh;
+    height: 100%;
+    width: 100%;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    position: relative;
   }
 
-  #view-menu, #view-hub, #view-create, #view-join, #view-room {
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  /* ---------------- LOBBY / HOME ---------------- */
-
-  .home-wrap {
+  /* ---------------- VIEWS ---------------- */
+  .view {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 32px 20px;
-    gap: 28px;
+    padding: 24px 16px;
+    gap: 20px;
+    overflow-y: auto;
   }
+  .view.hidden { display: none !important; }
 
+  /* ---------------- HOME ---------------- */
   .home-title {
-    font-size: 52px;
+    font-size: 48px;
     letter-spacing: 1px;
     color: var(--gold-bright);
     margin: 0;
@@ -1041,24 +1034,53 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .home-title .stamp-suits {
     display: block;
-    font-size: 22px;
+    font-size: 20px;
     letter-spacing: 8px;
     color: var(--cream);
     opacity: 0.65;
     margin-top: 6px;
   }
 
+  .menu-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+    max-width: 320px;
+  }
+
+  /* ---------------- SHARED UI ---------------- */
+  .screen-title {
+    font-size: 24px;
+    color: var(--gold-bright);
+    margin: 0 0 4px;
+    text-align: center;
+    font-weight: 700;
+  }
+
+  .back-link {
+    background: none;
+    border: none;
+    color: rgba(245,237,224,0.55);
+    font-family: 'Open Sans', sans-serif;
+    font-size: 14px;
+    align-self: flex-start;
+    padding: 4px 0;
+    margin-bottom: 4px;
+    cursor: pointer;
+  }
+  .back-link:hover { color: var(--cream); }
+
   .home-card {
     background: var(--bg-panel);
     border: 1px solid var(--line);
     border-radius: 6px 10px 5px 8px;
-    padding: 28px;
+    padding: 24px;
     width: 100%;
-    max-width: 380px;
+    max-width: 360px;
   }
 
   .field-label {
-    font-family: 'Open Sans', sans-serif;
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1.5px;
@@ -1070,19 +1092,19 @@ INDEX_HTML = """<!DOCTYPE html>
 
   input[type=text] {
     width: 100%;
-    padding: 13px 14px;
+    padding: 12px 14px;
     border-radius: 5px 8px 4px 7px;
     border: 1px solid var(--line);
     background: var(--bg-panel-2);
     color: var(--cream);
-    font-size: 17px;
+    font-size: 16px;
     font-family: 'Open Sans', sans-serif;
     outline: none;
-    margin-bottom: 16px;
+    margin-bottom: 14px;
   }
   input[type=text]:focus { border-color: var(--gold); }
   input[type=text]::placeholder { color: rgba(245,237,224,0.35); }
-  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 22px; font-family: 'Open Sans', sans-serif; }
+  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 20px; }
 
   button {
     font-family: 'Open Sans', sans-serif;
@@ -1115,39 +1137,10 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .btn-secondary:hover:not(:disabled) { background: rgba(63,139,126,0.12); }
 
-  .menu-buttons {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    width: 100%;
-    max-width: 340px;
-  }
-
-  .screen-title {
-    font-size: 26px;
-    color: var(--gold-bright);
-    margin: 0 0 4px;
-    text-align: center;
-    font-weight: 700;
-  }
-
-  .back-link {
-    background: none;
-    border: none;
-    color: rgba(245,237,224,0.55);
-    font-family: 'Open Sans', sans-serif;
-    font-size: 14px;
-    align-self: flex-start;
-    padding: 4px 0;
-    margin-bottom: 4px;
-    cursor: pointer;
-  }
-  .back-link:hover { color: var(--cream); }
-
   .team-picker {
     display: flex;
     gap: 10px;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
   }
   .team-btn {
     flex: 1;
@@ -1156,7 +1149,6 @@ INDEX_HTML = """<!DOCTYPE html>
     border: 1.5px solid rgba(245,237,224,0.18);
     border-radius: 5px 8px 4px 7px;
     color: rgba(245,237,224,0.7);
-    font-family: 'Open Sans', sans-serif;
     font-size: 14px;
     font-weight: 600;
     transition: all 0.15s ease;
@@ -1172,81 +1164,7 @@ INDEX_HTML = """<!DOCTYPE html>
     background: rgba(95,203,158,0.14);
     color: var(--teal-bright);
   }
-  .team-btn.full {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-  .team-btn:disabled { cursor: not-allowed; }
-
-  .exit-link {
-    background: none;
-    border: none;
-    color: rgba(245,237,224,0.4);
-    font-family: 'Open Sans', sans-serif;
-    font-size: 13px;
-    margin-top: 18px;
-    padding: 6px;
-    cursor: pointer;
-  }
-  .exit-link:hover { color: var(--red-suit); }
-
-  .exit-icon-btn {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    z-index: 20;
-    width: 30px;
-    height: 30px;
-    border-radius: 50%;
-    background: rgba(0,0,0,0.28);
-    border: none;
-    color: rgba(245,237,224,0.6);
-    font-size: 20px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    cursor: pointer;
-  }
-  .exit-icon-btn:hover { background: rgba(166,54,44,0.5); color: var(--cream); }
-
-  .confirm-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(4,14,9,0.82);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 90;
-    padding: 20px;
-  }
-  .confirm-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
-  .confirm-card {
-    background: var(--bg-panel);
-    border-radius: 8px 12px 6px 10px;
-    padding: 28px 24px;
-    max-width: 320px;
-    width: 100%;
-    text-align: center;
-  }
-  .confirm-text {
-    font-family: 'Open Sans', sans-serif;
-    font-size: 15px;
-    color: var(--cream);
-    margin-bottom: 20px;
-    line-height: 1.4;
-  }
-  .confirm-buttons {
-    display: flex;
-    gap: 10px;
-  }
-  .confirm-buttons button { flex: 1; padding: 12px; font-size: 14px; }
-  .btn-danger {
-    background: var(--red-suit);
-    color: var(--cream);
-    border-radius: 6px 10px 5px 8px;
-  }
+  .team-btn.full { opacity: 0.35; cursor: not-allowed; }
 
   .error-banner {
     background: rgba(166,54,44,0.25);
@@ -1254,52 +1172,48 @@ INDEX_HTML = """<!DOCTYPE html>
     color: #FFD9D4;
     padding: 10px 14px;
     border-radius: 4px 7px 3px 6px;
-    font-size: 14px;
-    font-family: 'Open Sans', sans-serif;
-    margin-bottom: 14px;
+    font-size: 13px;
+    margin-bottom: 12px;
     display: none;
   }
   .error-banner.show { display: block; }
 
-  /* ---------------- ROOM / WAITING ---------------- */
-
-  .room-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 40px 20px;
-    gap: 24px;
+  .exit-link {
+    background: none;
+    border: none;
+    color: rgba(245,237,224,0.4);
+    font-size: 13px;
+    margin-top: 14px;
+    padding: 6px;
+    cursor: pointer;
   }
+  .exit-link:hover { color: var(--red-suit); }
 
-  .room-code-display {
-    text-align: center;
-  }
+  /* ---------------- ROOM ---------------- */
+  .room-code-display { text-align: center; }
   .room-code-display .label {
-    font-family: 'Open Sans', sans-serif;
-    font-size: 12px;
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 2px;
     color: rgba(245,237,224,0.55);
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     font-weight: 600;
   }
   .room-code-display .code {
-    font-size: 48px;
-    letter-spacing: 10px;
+    font-size: 42px;
+    letter-spacing: 8px;
     color: var(--gold-bright);
     background: var(--bg-panel);
     border: 1px solid var(--line);
-    padding: 14px 20px 14px 30px;
+    padding: 12px 18px 12px 26px;
     border-radius: 6px 10px 5px 8px;
     display: inline-block;
     font-weight: 700;
   }
   .copy-hint {
-    font-family: 'Open Sans', sans-serif;
-    font-size: 13px;
+    font-size: 12px;
     color: rgba(245,237,224,0.5);
-    margin-top: 10px;
+    margin-top: 8px;
     cursor: pointer;
   }
   .copy-hint:hover { color: var(--gold); }
@@ -1307,32 +1221,28 @@ INDEX_HTML = """<!DOCTYPE html>
   .seats-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px;
+    gap: 10px;
     width: 100%;
-    max-width: 420px;
+    max-width: 400px;
   }
   .seat-slot {
     background: var(--bg-panel);
     border: 1px solid var(--line);
     border-radius: 5px 8px 4px 7px;
-    padding: 16px;
+    padding: 14px;
     text-align: center;
     position: relative;
   }
   .seat-slot.team-a { border-left: 3px solid var(--gold); }
   .seat-slot.team-b { border-left: 3px solid var(--teal-bright); }
   .seat-slot.empty { opacity: 0.4; border-style: dashed; }
-  .seat-slot .seat-name {
-    font-size: 16px;
-    font-weight: 700;
-  }
+  .seat-slot .seat-name { font-size: 15px; font-weight: 700; }
   .seat-slot .seat-team {
-    font-family: 'Open Sans', sans-serif;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
     opacity: 0.6;
-    margin-top: 4px;
+    margin-top: 3px;
     font-weight: 600;
   }
   .seat-slot .disconnected-badge {
@@ -1343,7 +1253,6 @@ INDEX_HTML = """<!DOCTYPE html>
     background: #A6362C;
   }
   .seat-slot .you-badge {
-    font-family: 'Open Sans', sans-serif;
     font-size: 9px;
     color: var(--gold);
     letter-spacing: 1px;
@@ -1352,59 +1261,57 @@ INDEX_HTML = """<!DOCTYPE html>
   }
 
   .waiting-note {
-    font-family: 'Open Sans', sans-serif;
-    font-size: 14px;
+    font-size: 13px;
     color: rgba(245,237,224,0.6);
     text-align: center;
   }
 
-  /* ---------------- GAME TABLE - VERTICAL LAYOUT ---------------- */
-
+  /* ---------------- GAME VIEW ---------------- */
   #view-game {
     flex: 1;
     display: flex;
     flex-direction: column;
-    max-width: 900px;
     width: 100%;
+    max-width: 900px;
     margin: 0 auto;
-    padding: 6px;
+    padding: 6px 8px 8px;
     min-height: 0;
     overflow: hidden;
     position: relative;
   }
 
-  /* Score cluster at very top */
-  .score-cluster {
+  /* Top bar: scores + 10s + trump */
+  .top-bar {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 8px;
-    flex-shrink: 0;
     gap: 8px;
+    padding: 2px 0 6px;
   }
 
-  .card-count {
+  .score-block {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 1px;
-    min-width: 44px;
+    gap: 2px;
+    min-width: 56px;
   }
-  .card-count-num {
-    font-size: 26px;
-    font-weight: 700;
-    color: var(--gold-bright);
-    line-height: 1;
-  }
-  .card-count-label {
+  .score-block-label {
     font-size: 9px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     opacity: 0.7;
-    font-weight: 600;
+    font-weight: 700;
+  }
+  .score-block-num {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--gold-bright);
+    line-height: 1;
   }
 
-  .score-center {
+  .center-info {
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1421,10 +1328,8 @@ INDEX_HTML = """<!DOCTYPE html>
     height: clamp(22px, 5.5vw, 30px);
     border-radius: 3px 5px 2px 4px;
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    font-family: 'Open Sans', sans-serif;
     font-weight: 700;
     font-size: 7px;
     line-height: 1;
@@ -1448,9 +1353,9 @@ INDEX_HTML = """<!DOCTYPE html>
   .ten-slot.won.mine { border: 1.5px solid var(--gold); }
   .ten-slot.won.theirs { border: 1.5px solid var(--teal-bright); }
 
-  .trump-card-box {
-    width: clamp(26px, 6.5vw, 36px);
-    height: clamp(36px, 9vw, 50px);
+  .trump-box {
+    width: clamp(28px, 7vw, 36px);
+    height: clamp(38px, 9.5vw, 50px);
     border-radius: 4px 6px 3px 5px;
     display: flex;
     align-items: center;
@@ -1458,12 +1363,11 @@ INDEX_HTML = """<!DOCTYPE html>
     font-size: clamp(14px, 3.5vw, 20px);
     background: rgba(0,0,0,0.16);
     color: rgba(245,237,224,0.3);
-    font-family: 'Open Sans', sans-serif;
     font-weight: 700;
     flex-shrink: 0;
     transition: transform 0.3s cubic-bezier(.2,1.4,.4,1), background 0.3s ease;
   }
-  .trump-card-box.revealed {
+  .trump-box.revealed {
     background: var(--cream);
     animation: trumpLockIn 0.5s cubic-bezier(.2,1.4,.4,1);
   }
@@ -1472,23 +1376,23 @@ INDEX_HTML = """<!DOCTYPE html>
     60% { transform: scale(0.92) rotate(3deg); }
     100% { transform: scale(1) rotate(0deg); }
   }
-  .trump-card-box.revealed.red { color: var(--red-suit); }
-  .trump-card-box.revealed.black { color: var(--ink); }
+  .trump-box.revealed.red { color: var(--red-suit); }
+  .trump-box.revealed.black { color: var(--ink); }
 
-  /* Table felt in middle */
+  /* Table felt */
   .table-felt {
     flex: 1;
-    position: relative;
     min-height: 0;
     display: grid;
     grid-template-areas:
       ".    top    ."
       "left center right"
       ".    bottom .";
-    grid-template-columns: clamp(40px, 12vw, 60px) 1fr clamp(40px, 12vw, 60px);
-    grid-template-rows: clamp(36px, 10vh, 56px) 1fr clamp(36px, 10vh, 56px);
-    padding: 4px;
+    grid-template-columns: clamp(44px, 13vw, 64px) 1fr clamp(44px, 13vw, 64px);
+    grid-template-rows: clamp(32px, 9vh, 52px) 1fr clamp(32px, 9vh, 52px);
+    padding: 2px;
     gap: 2px;
+    position: relative;
   }
 
   .seat-marker {
@@ -1497,7 +1401,6 @@ INDEX_HTML = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     gap: 2px;
-    font-family: 'Open Sans', sans-serif;
   }
   .seat-marker .seat-mini-name {
     font-size: 11px;
@@ -1518,9 +1421,7 @@ INDEX_HTML = """<!DOCTYPE html>
     transform: scale(0.5);
     transition: opacity 0.25s ease, transform 0.25s ease;
   }
-  .seat-marker.active .seat-mini-name {
-    color: var(--gold-bright);
-  }
+  .seat-marker.active .seat-mini-name { color: var(--gold-bright); }
   .seat-marker.active .turn-dot {
     opacity: 1;
     transform: scale(1);
@@ -1547,15 +1448,15 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .trick-slot {
     position: absolute;
-    width: clamp(34px, 8vw, 44px);
-    height: clamp(48px, 11vw, 60px);
+    width: clamp(32px, 7.5vw, 42px);
+    height: clamp(45px, 10.5vw, 58px);
   }
-  .trick-slot.pos-top { top: 4px; left: 50%; transform: translateX(-50%); }
-  .trick-slot.pos-left { left: 4px; top: 50%; transform: translateY(-50%); }
-  .trick-slot.pos-right { right: 4px; top: 50%; transform: translateY(-50%); }
-  .trick-slot.pos-bottom { bottom: 4px; left: 50%; transform: translateX(-50%); }
+  .trick-slot.pos-top { top: 2px; left: 50%; transform: translateX(-50%); }
+  .trick-slot.pos-left { left: 2px; top: 50%; transform: translateY(-50%); }
+  .trick-slot.pos-right { right: 2px; top: 50%; transform: translateY(-50%); }
+  .trick-slot.pos-bottom { bottom: 2px; left: 50%; transform: translateX(-50%); }
 
-  /* Directional entry animations for trick cards */
+  /* Directional entry animations */
   .trick-slot.enter-bottom { animation: enterBottom 0.35s ease; }
   .trick-slot.enter-top { animation: enterTop 0.35s ease; }
   .trick-slot.enter-left { animation: enterLeft 0.35s ease; }
@@ -1578,44 +1479,36 @@ INDEX_HTML = """<!DOCTYPE html>
     to { opacity: 1; transform: translateY(-50%) translateX(0); }
   }
 
-  /* Trick collection animation */
+  /* Trick collection */
   .trick-center.collect-mine .trick-slot { animation: collectLeft 0.5s ease forwards; }
   .trick-center.collect-theirs .trick-slot { animation: collectRight 0.5s ease forwards; }
+  @keyframes collectLeft { to { opacity: 0; left: -30%; } }
+  @keyframes collectRight { to { opacity: 0; left: 130%; } }
 
-  @keyframes collectLeft {
-    to { opacity: 0; left: -30%; }
-  }
-  @keyframes collectRight {
-    to { opacity: 0; left: 130%; }
-  }
-
-  /* playing card */
+  /* Playing card on table */
   .pcard {
-    width: clamp(34px, 8vw, 44px);
-    height: clamp(48px, 11vw, 60px);
+    width: clamp(32px, 7.5vw, 42px);
+    height: clamp(45px, 10.5vw, 58px);
     background: var(--cream);
     border-radius: 4px 6px 3px 5px;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     padding: 3px 4px;
-    font-family: 'Open Sans', sans-serif;
     font-weight: 700;
     position: relative;
-    flex-shrink: 0;
   }
   .pcard.red { color: var(--red-suit); }
   .pcard.black { color: var(--ink); }
-  .pcard .pcard-rank { font-size: 12px; line-height: 1; }
+  .pcard .pcard-rank { font-size: 11px; line-height: 1; }
   .pcard .pcard-suit-big {
     position: absolute;
     top: 50%; left: 50%;
     transform: translate(-50%, -50%);
-    font-size: 18px;
+    font-size: 16px;
     opacity: 0.85;
   }
   .pcard .pcard-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-
   .pcard.trump-marked::after {
     content: "";
     position: absolute;
@@ -1625,63 +1518,22 @@ INDEX_HTML = """<!DOCTYPE html>
     background: var(--gold);
   }
 
-  /* hand strip at bottom */
-  .hand-strip-wrap {
+  /* Bottom hand area */
+  .hand-area {
     flex-shrink: 0;
-    padding: 4px;
-    min-height: 0;
-  }
-
-  .hand-strip {
-    display: flex;
-    justify-content: center;
-    align-items: flex-end;
-    gap: 4px;
-    padding: 2px 4px 6px;
-    height: 100%;
-    min-height: 0;
-    --hand-scale: 1;
-  }
-
-  .hand-card {
-    width: calc(52px * var(--hand-scale));
-    height: calc(72px * var(--hand-scale));
-    background: var(--cream);
-    border-radius: 4px 7px 3px 6px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
-    padding: 4px 5px;
-    font-family: 'Open Sans', sans-serif;
-    font-weight: 700;
-    cursor: pointer;
-    transition: transform 0.12s ease, opacity 0.2s ease;
-    position: relative;
-    flex-shrink: 0;
-    user-select: none;
+    gap: 4px;
+    padding: 4px 2px 6px;
+    min-height: 0;
   }
-  .hand-card.red { color: var(--red-suit); }
-  .hand-card.black { color: var(--ink); }
-  .hand-card .hc-rank { font-size: 14px; line-height: 1; }
-  .hand-card .hc-suit-big {
-    position: absolute;
-    top: 50%; left: 50%;
-    transform: translate(-50%,-50%);
-    font-size: 22px;
-    opacity: 0.85;
-  }
-  .hand-card .hc-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-  .hand-card:hover { transform: translateY(-6px); z-index: 5; }
-  .hand-card.playable:hover { transform: translateY(-8px); outline: 2px solid var(--gold-bright); outline-offset: -2px; }
-  .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
-  .hand-card.disabled:hover { transform: none; outline: none; }
-  .hand-card.trump-marked { outline: 1.5px solid var(--gold); outline-offset: -1.5px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px); }
 
   .action-bar {
     text-align: center;
-    padding: 4px 0 2px;
     min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .reveal-btn {
     padding: 8px 18px;
@@ -1690,9 +1542,60 @@ INDEX_HTML = """<!DOCTYPE html>
     border-radius: 16px 20px 14px 18px;
     font-size: 13px;
     font-weight: 700;
+    cursor: pointer;
   }
 
-  /* trump reveal flash overlay */
+  .hand-strip {
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 4px;
+    padding: 2px 4px;
+    min-height: 0;
+    --hand-scale: 1;
+    touch-action: manipulation;
+  }
+
+  .hand-card {
+    width: calc(48px * var(--hand-scale));
+    height: calc(67px * var(--hand-scale));
+    background: var(--cream);
+    border-radius: 4px 7px 3px 6px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 4px 5px;
+    font-weight: 700;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    transition: transform 0.12s ease, opacity 0.2s ease, outline 0.12s ease;
+    outline: none;
+  }
+  .hand-card.red { color: var(--red-suit); }
+  .hand-card.black { color: var(--ink); }
+  .hand-card .hc-rank { font-size: 13px; line-height: 1; }
+  .hand-card .hc-suit-big {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    font-size: 20px;
+    opacity: 0.85;
+    pointer-events: none;
+  }
+  .hand-card .hc-rank.bottom { align-self: flex-end; transform: rotate(180deg); pointer-events: none; }
+
+  .hand-card.playable:hover { transform: translateY(-8px); outline: 2px solid var(--gold-bright); }
+  .hand-card.playable:active { transform: translateY(-4px) scale(0.97); }
+  .hand-card.disabled { opacity: 0.35; cursor: not-allowed; }
+  .hand-card.disabled:hover { transform: none; outline: none; }
+  .hand-card.trump-marked { outline: 1.5px solid var(--gold); outline-offset: -1.5px; }
+  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-6px); }
+
+  /* Overlays */
   .trump-flash {
     position: fixed;
     inset: 0;
@@ -1704,14 +1607,14 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .trump-flash.show { display: flex; animation: fadeIn 0.2s ease; }
   .trump-flash .stamp {
-    width: 120px;
-    height: 168px;
+    width: 110px;
+    height: 154px;
     border-radius: 10px 14px 8px 12px;
     background: var(--cream);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 80px;
+    font-size: 72px;
     animation: stampIn 0.4s cubic-bezier(.2,1.4,.4,1);
   }
   .trump-flash .stamp.red { color: var(--red-suit); }
@@ -1723,7 +1626,6 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-  /* hand complete overlay */
   .result-overlay {
     position: fixed;
     inset: 0;
@@ -1739,71 +1641,91 @@ INDEX_HTML = """<!DOCTYPE html>
     background: var(--bg-panel);
     border: 1px solid var(--line);
     border-radius: 8px 12px 6px 10px;
-    padding: 32px 26px;
+    padding: 28px 24px;
     text-align: center;
     max-width: 340px;
     width: 100%;
   }
   .result-headline {
-    font-size: 28px;
+    font-size: 26px;
     color: var(--gold-bright);
     margin: 0 0 6px;
     font-weight: 700;
   }
   .result-headline.draw { color: rgba(245,237,224,0.75); }
   .result-sub {
-    font-family: 'Open Sans', sans-serif;
     font-size: 14px;
     color: rgba(245,237,224,0.6);
-    margin-bottom: 22px;
+    margin-bottom: 20px;
   }
   .result-mendi-row {
     display: flex;
     justify-content: center;
-    gap: 24px;
-    margin-bottom: 26px;
+    gap: 20px;
+    margin-bottom: 20px;
   }
   .result-mendi-row .mendi-counter {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
   .result-mendi-row .mendi-label {
-    font-family: 'Open Sans', sans-serif;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 1px;
     opacity: 0.6;
     font-weight: 600;
   }
-  .result-mendi-row .ten-slots { gap: 5px; }
+  .result-mendi-row .ten-slots { gap: 4px; }
   .result-mendi-row .ten-slot {
-    width: 24px;
-    height: 34px;
-    font-size: 9px;
+    width: 22px;
+    height: 32px;
+    font-size: 8px;
   }
-  .result-mendi-row .ten-slot .ts-suit { font-size: 14px; }
+  .result-mendi-row .ten-slot .ts-suit { font-size: 13px; }
 
   .result-card-counts {
     display: flex;
     justify-content: center;
-    gap: 40px;
-    margin-bottom: 22px;
+    gap: 36px;
+    margin-bottom: 20px;
   }
-  .result-cc {
+  .result-cc { text-align: center; }
+  .result-cc-num { font-size: 22px; font-weight: 700; color: var(--gold-bright); }
+  .result-cc-label { font-size: 10px; text-transform: uppercase; opacity: 0.6; font-weight: 600; }
+
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(4,14,9,0.82);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 90;
+    padding: 20px;
+  }
+  .confirm-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
+  .confirm-card {
+    background: var(--bg-panel);
+    border-radius: 8px 12px 6px 10px;
+    padding: 24px 20px;
+    max-width: 320px;
+    width: 100%;
     text-align: center;
   }
-  .result-cc-num {
-    font-size: 24px;
-    font-weight: 700;
-    color: var(--gold-bright);
+  .confirm-text {
+    font-size: 15px;
+    color: var(--cream);
+    margin-bottom: 18px;
+    line-height: 1.4;
   }
-  .result-cc-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    opacity: 0.6;
-    font-weight: 600;
+  .confirm-buttons { display: flex; gap: 10px; }
+  .confirm-buttons button { flex: 1; padding: 12px; font-size: 14px; }
+  .btn-danger {
+    background: var(--red-suit);
+    color: var(--cream);
+    border-radius: 6px 10px 5px 8px;
   }
 
   .toast {
@@ -1816,7 +1738,6 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--cream);
     padding: 12px 20px;
     border-radius: 20px;
-    font-family: 'Open Sans', sans-serif;
     font-size: 13px;
     z-index: 100;
     opacity: 0;
@@ -1825,21 +1746,39 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .toast.show { opacity: 1; }
 
-  .hidden { display: none !important; }
+  .exit-icon-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 20;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.28);
+    border: none;
+    color: rgba(245,237,224,0.6);
+    font-size: 20px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    cursor: pointer;
+  }
+  .exit-icon-btn:hover { background: rgba(166,54,44,0.5); color: var(--cream); }
 
   @media (max-width: 380px) {
-    .home-title { font-size: 42px; }
-    .room-code-display .code { font-size: 38px; letter-spacing: 7px; }
+    .home-title { font-size: 40px; }
+    .room-code-display .code { font-size: 34px; letter-spacing: 6px; }
   }
-
   @media (max-height: 420px) {
     .table-felt {
-      grid-template-columns: clamp(30px, 9vw, 48px) 1fr clamp(30px, 9vw, 48px);
-      grid-template-rows: clamp(30px, 12vh, 44px) 1fr clamp(30px, 12vh, 44px);
+      grid-template-columns: clamp(36px, 10vw, 52px) 1fr clamp(36px, 10vw, 52px);
+      grid-template-rows: clamp(26px, 12vh, 44px) 1fr clamp(26px, 12vh, 44px);
     }
     .ten-slot { width: 14px; height: 20px; }
-    .trump-card-box { width: 24px; height: 34px; font-size: 13px; }
-    .card-count-num { font-size: 20px; }
+    .trump-box { width: 24px; height: 34px; font-size: 13px; }
+    .score-block-num { font-size: 20px; }
   }
 </style>
 </head>
@@ -1847,7 +1786,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <div id="app">
 
   <!-- ============ LANDING MENU ============ -->
-  <div id="view-menu" class="home-wrap">
+  <div id="view-menu" class="view">
     <h1 class="home-title">Mendikot<span class="stamp-suits">\u2660 \u2665 \u2666 \u2663</span></h1>
     <div class="menu-buttons">
       <button class="btn-primary" id="btn-solo">Solo</button>
@@ -1856,7 +1795,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============ HUB SCREEN ============ -->
-  <div id="view-hub" class="home-wrap hidden">
+  <div id="view-hub" class="view hidden">
     <button class="back-link" id="btn-hub-back">&larr; Back</button>
     <h2 class="screen-title">Play with Friends</h2>
     <div class="menu-buttons">
@@ -1866,7 +1805,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============ CREATE ROOM SCREEN ============ -->
-  <div id="view-create" class="home-wrap hidden">
+  <div id="view-create" class="view hidden">
     <button class="back-link" id="btn-create-back">&larr; Back</button>
     <h2 class="screen-title">Create Room</h2>
     <div class="home-card">
@@ -1883,7 +1822,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============ JOIN ROOM SCREEN ============ -->
-  <div id="view-join" class="home-wrap hidden">
+  <div id="view-join" class="view hidden">
     <button class="back-link" id="btn-join-back">&larr; Back</button>
     <h2 class="screen-title">Join Room</h2>
     <div class="home-card">
@@ -1902,7 +1841,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============ ROOM / LOBBY VIEW ============ -->
-  <div id="view-room" class="room-wrap hidden">
+  <div id="view-room" class="view hidden">
     <div class="room-code-display">
       <div class="label">Room Code</div>
       <div class="code" id="room-code-text">-----</div>
@@ -1918,26 +1857,35 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============ GAME TABLE VIEW ============ -->
-  <div id="view-game" class="hidden" style="flex:1; display:flex; flex-direction:column; max-width:900px; width:100%; margin:0 auto; padding:6px; min-height:0; overflow:hidden; position:relative;">
+  <div id="view-game" class="hidden">
     <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
 
-    <!-- Score cluster at top -->
-    <div class="score-cluster">
-      <div class="card-count mine">
-        <div class="card-count-num" id="my-card-count">0</div>
-        <div class="card-count-label">Cards</div>
+    <!-- Top bar: Your Cards | Your 10s | Trump | Opp 10s | Opp Cards -->
+    <div class="top-bar">
+      <div class="score-block">
+        <div class="score-block-label">Your Cards</div>
+        <div class="score-block-num" id="my-card-count">0</div>
       </div>
-      <div class="score-center">
-        <div class="ten-slots" id="ten-slots"></div>
-        <div class="trump-card-box" id="trump-symbol">?</div>
+
+      <div class="center-info">
+        <div class="score-block-label" style="margin-bottom:2px;">Your 10s</div>
+        <div class="ten-slots" id="my-ten-slots"></div>
       </div>
-      <div class="card-count theirs">
-        <div class="card-count-num" id="opp-card-count">0</div>
-        <div class="card-count-label">Cards</div>
+
+      <div class="trump-box" id="trump-symbol">?</div>
+
+      <div class="center-info">
+        <div class="score-block-label" style="margin-bottom:2px;">Opp 10s</div>
+        <div class="ten-slots" id="opp-ten-slots"></div>
+      </div>
+
+      <div class="score-block">
+        <div class="score-block-label">Opp Cards</div>
+        <div class="score-block-num" id="opp-card-count">0</div>
       </div>
     </div>
 
-    <!-- Table felt in middle -->
+    <!-- Table felt -->
     <div class="table-felt">
       <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
       <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
@@ -1947,8 +1895,8 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="trick-center" id="trick-center"></div>
     </div>
 
-    <!-- Hand strip at bottom -->
-    <div class="hand-strip-wrap">
+    <!-- Bottom hand area -->
+    <div class="hand-area">
       <div class="action-bar" id="action-bar"></div>
       <div class="hand-strip" id="hand-strip"></div>
     </div>
@@ -2047,7 +1995,13 @@ INDEX_HTML = """<!DOCTYPE html>
     S.view = name;
     ALL_VIEWS.forEach(v => {
       const el = document.getElementById('view-' + v);
-      if (el) el.classList.toggle('hidden', v !== name);
+      if (el) {
+        el.classList.toggle('hidden', v !== name);
+        if (v === 'game') {
+          el.style.display = v === name ? 'flex' : 'none';
+          el.style.flexDirection = 'column';
+        }
+      }
     });
   }
 
@@ -2061,6 +2015,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   function showError(bannerId, msg) {
     const el = document.getElementById(bannerId);
+    if (!el) return;
     el.textContent = msg;
     el.classList.add('show');
   }
@@ -2373,15 +2328,16 @@ INDEX_HTML = """<!DOCTYPE html>
     document.getElementById('my-card-count').textContent = myCards;
     document.getElementById('opp-card-count').textContent = oppCards;
 
-    renderTenSlots('ten-slots', mineMendiSuits, theirsMendiSuits);
+    renderTenSlots('my-ten-slots', mineMendiSuits, 'mine');
+    renderTenSlots('opp-ten-slots', theirsMendiSuits, 'theirs');
 
     // trump
     const trumpBox = document.getElementById('trump-symbol');
     if (st.trump_suit) {
-      trumpBox.className = 'trump-card-box revealed ' + (RED_SUITS.has(st.trump_suit) ? 'red' : 'black');
+      trumpBox.className = 'trump-box revealed ' + (RED_SUITS.has(st.trump_suit) ? 'red' : 'black');
       trumpBox.textContent = SUIT_SYMBOL[st.trump_suit];
     } else {
-      trumpBox.className = 'trump-card-box';
+      trumpBox.className = 'trump-box';
       trumpBox.textContent = '?';
     }
 
@@ -2398,7 +2354,7 @@ INDEX_HTML = """<!DOCTYPE html>
       nameEl.textContent = (seat === mySeat ? 'You' : seatInfo.name);
     }
 
-    // trick center - diff-based to animate only new cards
+    // trick center
     renderTrick(st, order);
 
     // action bar
@@ -2417,19 +2373,17 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // hand strip - diff-based, no re-animation
+    // hand strip
     renderHand(st);
   }
 
-  function renderTenSlots(containerId, mineSuits, theirsSuits) {
+  function renderTenSlots(containerId, suits, kind) {
     const el = document.getElementById(containerId);
     el.innerHTML = '';
-    const mineSet = new Set(mineSuits);
-    const theirsSet = new Set(theirsSuits);
+    const wonSet = new Set(suits);
     SUITS_ORDER.forEach(suit => {
       const slot = document.createElement('div');
-      const isWon = mineSet.has(suit) || theirsSet.has(suit);
-      const kind = mineSet.has(suit) ? 'mine' : (theirsSet.has(suit) ? 'theirs' : '');
+      const isWon = wonSet.has(suit);
       const color = RED_SUITS.has(suit) ? 'red' : 'black';
       slot.className = 'ten-slot' + (isWon ? ' won ' + color + ' ' + kind : '');
       slot.innerHTML = '<div class="ts-suit">' + SUIT_SYMBOL[suit] + '</div>';
@@ -2482,6 +2436,7 @@ INDEX_HTML = """<!DOCTYPE html>
   function animateTrickCollection(winnerTeam) {
     const center = document.getElementById('trick-center');
     center.classList.add('collect-' + winnerTeam);
+    setTimeout(() => center.classList.remove('collect-mine', 'collect-theirs'), 600);
   }
 
   function renderHand(st) {
@@ -2490,7 +2445,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // Calculate scale to fit all cards without scrolling
     const containerWidth = strip.parentElement.clientWidth - 8;
-    const baseCardWidth = 52;
+    const baseCardWidth = 48;
     const gap = 4;
     const totalWidth = hand.length * baseCardWidth + (hand.length - 1) * gap;
     const scale = totalWidth > containerWidth ? containerWidth / totalWidth : 1;
@@ -2548,7 +2503,7 @@ INDEX_HTML = """<!DOCTYPE html>
     S.lastHand = hand.slice();
   }
 
-  // Delegated click handler for hand cards
+  // Click handler for hand cards
   document.getElementById('hand-strip').addEventListener('click', (e) => {
     const cardEl = e.target.closest('.hand-card');
     if (!cardEl) return;
@@ -2565,6 +2520,25 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
   });
+
+  // Touch handler for mobile responsiveness
+  document.getElementById('hand-strip').addEventListener('touchend', (e) => {
+    e.preventDefault();
+    const cardEl = e.target.closest('.hand-card');
+    if (!cardEl) return;
+    const card = cardEl.dataset.card;
+    if (!card || !S.gameState) return;
+
+    if (S.pendingReveal && S.gameState.turn_seat === S.mySeat) {
+      S.selectedRevealCard = card;
+      renderGame();
+    } else if (S.gameState.turn_seat === S.mySeat) {
+      const legal = computeLegalMoves(S.gameState, S.gameState.your_hand || []);
+      if (legal.has(card)) {
+        send({ type: 'play_card', card: card });
+      }
+    }
+  }, { passive: false });
 
   function computeLegalMoves(st, hand) {
     if (!st.current_trick || st.current_trick.length === 0) {
@@ -2631,8 +2605,8 @@ INDEX_HTML = """<!DOCTYPE html>
     row.innerHTML =
       '<div class="mendi-counter mine"><div class="mendi-label">Your Team</div><div class="ten-slots" id="result-my-slots"></div></div>' +
       '<div class="mendi-counter theirs"><div class="mendi-label">Opponents</div><div class="ten-slots" id="result-opp-slots"></div></div>';
-    renderTenSlots('result-my-slots', mineSuits, []);
-    renderTenSlots('result-opp-slots', theirsSuits, []);
+    renderTenSlots('result-my-slots', mineSuits, 'mine');
+    renderTenSlots('result-opp-slots', theirsSuits, 'theirs');
 
     ccRow.innerHTML =
       '<div class="result-cc"><div class="result-cc-num">' + mineC + '</div><div class="result-cc-label">Your Cards</div></div>' +
