@@ -1,2757 +1,592 @@
+#!/usr/bin/env python3
 """
-Mendikot (Hukum-style trump reveal) - single-file FastAPI app.
-
-No login, no database, no persistence beyond process memory.
-Rooms are ephemeral, held in RAM, and garbage-collected after inactivity.
-
-Run:
-    pip install fastapi "uvicorn[standard]" --break-system-packages
-    python3 main.py
-    (or: uvicorn main:app --host 0.0.0.0 --port 8000)
-
-Then open http://localhost:8000 in up to 4 browser tabs/devices.
+Mendikot - Classic Indian Card Game
+Run: python main.py   then open http://localhost:8000
+Requires: pip install fastapi uvicorn
 """
-
-import asyncio
-import json
-import random
-import string
-import time
-import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-
+import asyncio, json, random, uuid
+from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+import uvicorn
 
-"""
-Mendikot game engine - pure logic, no I/O.
-Rules implemented (as specified):
-- 4 players, seats 0-3. Teams: {0,2} vs {1,3}.
-- Deal 5 cards each first (20 dealt, 32 in boot).
-- Play tricks. First player unable to follow suit MUST reveal a trump
-  card from hand (their choice). Revealing is a single action that:
-  locks the trump suit, immediately plays that same card into the
-  current trick (possibly completing it), and only THEN deals all
-  remaining boot cards (32, 8 per seat) to everyone. There is no
-  separate follow-up tap to "play" the revealed card - the reveal IS
-  the play.
-- If all first 5 tricks complete with everyone following suit (nobody
-  ever revealed), the hand has NO TRUMP for its entirety, and the
-  remaining 32 cards are dealt only after that 5th trick finishes.
-- Winner of trick leads next.
-- Must follow suit if able. If void: may play trump (if revealed) or
-  any card. If trump never revealed, may play any card when void.
-- Mendi = the four 10s. Team with more Mendi wins (4-0 or 3-1).
-  2-2 is a draw.
-"""
-
-
-SUITS = ["S", "H", "D", "C"]  # Spades, Hearts, Diamonds, Clubs
-RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
-RANK_VALUE = {r: i for i, r in enumerate(RANKS)}
-
-SUIT_SYMBOL = {"S": "\u2660", "H": "\u2665", "D": "\u2666", "C": "\u2663"}
-
-
-class Phase(str, Enum):
-    LOBBY = "LOBBY"
-    PHASE1_PLAY = "PHASE1_PLAY"          # first 5 tricks
-    AWAITING_TRUMP_REVEAL = "AWAITING_TRUMP_REVEAL"  # blocked on one player's choice
-    PHASE2_PLAY = "PHASE2_PLAY"          # remaining 8 tricks
-    HAND_COMPLETE = "HAND_COMPLETE"
-
+# ════ GAME ENGINE ════
+SUITS = ['S','H','D','C']
+SNAME = {'S':'Spades','H':'Hearts','D':'Diamonds','C':'Clubs'}
 
 def make_deck():
-    return [f"{r}{s}" for s in SUITS for r in RANKS]
+    return [{'s':s,'r':r} for s in SUITS for r in range(2,15)]
 
+def shuf(d):
+    x=d[:]; random.shuffle(x); return x
 
-def card_rank(card: str) -> str:
-    return card[:-1]
+def ckey(c): return f"{c['r']}{c['s']}"
 
+def valid_plays(hand, led, trump, ph1, tout):
+    if not led: return [dict(**c,mr=False) for c in hand]
+    can = any(c['s']==led for c in hand)
+    if can: return [dict(**c,mr=False) for c in hand if c['s']==led]
+    if ph1 and not tout: return [dict(**c,mr=True) for c in hand]
+    return [dict(**c,mr=False) for c in hand]
 
-def card_suit(card: str) -> str:
-    return card[-1]
-
-
-class Card:
-    """Helper for parsing/formatting; cards are stored as plain strings e.g. '10H', 'AS'."""
-    pass
-
-
-class MendikotHand:
-    """
-    Represents a single hand (deal) of Mendikot for one room.
-    Seats 0-3. Teams: team A = {0,2}, team B = {1,3}.
-    """
-
-    def __init__(self, dealer_seat: int = 0, rng: Optional[random.Random] = None):
-        self.rng = rng or random.Random()
-        self.dealer_seat = dealer_seat
-        deck = make_deck()
-        self.rng.shuffle(deck)
-
-        # Deal 5 cards to each seat first, then keep remaining 32 as "boot"
-        self.hands = {s: [] for s in range(4)}
-        for i in range(5):
-            for s in range(4):
-                self.hands[s].append(deck.pop())
-        self.boot = deck  # 32 cards remaining, to be dealt after phase 1
-
-        self.phase = Phase.PHASE1_PLAY
-        self.trump_suit: Optional[str] = None
-        self.trump_revealed_card: Optional[str] = None
-        self.trump_revealer_seat: Optional[int] = None
-
-        self.current_trick: list[dict] = []  # [{seat, card}]
-        self.led_suit: Optional[str] = None
-        self.turn_seat = (dealer_seat + 1) % 4  # player left of dealer leads first
-        self.leader_seat = self.turn_seat
-
-        self.tricks_played = 0
-        self.trick_history: list[dict] = []  # completed tricks: {cards, winner_seat, mendi_count}
-
-        self.mendi_won = {0: 0, 1: 0, 2: 0, 3: 0}  # mendi count per seat (aggregate by team later)
-        self.mendi_suits_won = {0: [], 1: [], 2: [], 3: []}  # which ten-suits each seat has won
-
-        # tracks whether we're still in the "watch for void" sub-phase
-        self.awaiting_reveal_from: Optional[int] = None
-        self.pending_void_card: Optional[str] = None  # the card that triggered the reveal requirement
-
-        # If a mid-trick deal happens (trump revealed mid-trick), any seat that
-        # was already known to be void in the led suit at that moment stays
-        # exempt from follow-suit for the REST of that specific trick, even if
-        # their newly dealt cards happen to include the led suit. Cleared
-        # whenever a new trick starts.
-        self.trick_void_exempt_seats: set[int] = set()
-
-        # True from the moment trump is revealed until the boot cards have
-        # actually been dealt. The reveal happens mid-trick, but the boot deal
-        # itself is deferred until the CURRENT trick finishes (all 4 plays in),
-        # so opponents can't infer anything about the newly dealt cards from
-        # watching mid-trick.
-        self.boot_deal_pending: bool = False
-
-        self.winner_team: Optional[str] = None  # "A", "B", or "DRAW"
-        self.final_mendi: Optional[dict] = None  # {"A": n, "B": n}
-
-    # ---------- helpers ----------
-
-    def team_of(self, seat: int) -> str:
-        return "A" if seat in (0, 2) else "B"
-
-    def legal_moves(self, seat: int) -> list[str]:
-        hand = self.hands[seat]
-        if not self.current_trick:
-            return list(hand)  # leading, any card legal
-        if seat in self.trick_void_exempt_seats:
-            return list(hand)  # locked-in void status for this trick, any card legal
-        led = self.led_suit
-        same_suit = [c for c in hand if card_suit(c) == led]
-        if same_suit:
-            return same_suit
-        # void in led suit: any card is legal (including trump if revealed)
-        return list(hand)
-
-    def must_reveal_trump(self, seat: int, card_being_played_suit_check: bool) -> bool:
-        """True if this seat, being void in led suit during phase 1 pre-reveal, must reveal."""
-        return (
-            self.phase == Phase.PHASE1_PLAY
-            and self.trump_suit is None
-            and self.current_trick
-            and card_being_played_suit_check
-        )
-
-    # ---------- actions ----------
-
-    def play_card(self, seat: int, card: str) -> dict:
-        """
-        Attempt to play `card` for `seat`. Returns an event dict describing what happened.
-        Raises ValueError on illegal move.
-        """
-        if self.phase not in (Phase.PHASE1_PLAY, Phase.PHASE2_PLAY):
-            raise ValueError("Not in a playable phase")
-        if seat != self.turn_seat:
-            raise ValueError("Not your turn")
-        if card not in self.hands[seat]:
-            raise ValueError("Card not in hand")
-
-        hand = self.hands[seat]
-        is_leading = not self.current_trick
-
-        if not is_leading and seat not in self.trick_void_exempt_seats:
-            led = self.led_suit
-            has_led_suit = any(card_suit(c) == led for c in hand)
-            if has_led_suit and card_suit(card) != led:
-                raise ValueError(f"Must follow suit ({led})")
-
-            # If void in led suit during phase 1 pre-reveal -> must reveal trump instead of playing
-            if (
-                not has_led_suit
-                and self.phase == Phase.PHASE1_PLAY
-                and self.trump_suit is None
-            ):
-                raise ValueError("VOID_MUST_REVEAL_TRUMP")
-
-        # legal - commit the play
-        hand.remove(card)
-        self.current_trick.append({"seat": seat, "card": card})
-        if is_leading:
-            self.led_suit = card_suit(card)
-
-        result = {"type": "card_played", "seat": seat, "card": card}
-
-        if len(self.current_trick) == 4:
-            trick_result = self._resolve_trick()
-            result["trick_result"] = trick_result
+def trick_win(tcs, led, trump):
+    best=tcs[0]
+    for cur in tcs[1:]:
+        if trump:
+            cb=best['c']['s']==trump; cc=cur['c']['s']==trump
+            if cc and not cb: best=cur; continue
+            if cc and cb:
+                if cur['c']['r']>best['c']['r']: best=cur; continue
+            if not cc and not cb:
+                if cur['c']['s']==led and (best['c']['s']!=led or cur['c']['r']>best['c']['r']): best=cur
         else:
-            self.turn_seat = (self.turn_seat + 1) % 4
+            if cur['c']['s']==led and (best['c']['s']!=led or cur['c']['r']>best['c']['r']): best=cur
+    return best['seat']
 
-        return result
+class Game:
+    def __init__(self, players):
+        self.players=players
+        deck=shuf(make_deck())
+        self.hands=[deck[i*5:(i+1)*5] for i in range(4)]
+        self.boot=deck[20:]
+        self.ph1=True; self.trump=None; self.tout=False
+        self.trick={'cards':[],'led':None}
+        self.tnum=0; self.boot_dealt=False; self.paused=False
+        self.whose=1; self.taken=[[],[],[],[]]; self.team_mn=[0,0]; self.seat_mn=[0,0,0,0]; self.done=False
 
-    def reveal_trump(self, seat: int, card: str) -> dict:
-        """
-        Player reveals a trump card from hand (their own choice) when void in
-        led suit. This single action: (1) locks the trump suit, (2) immediately
-        plays that same card into the current trick - possibly completing the
-        trick. The boot cards are NOT dealt here - dealing is deferred until
-        the current trick actually finishes (see _resolve_trick), so that
-        opponents watching the rest of this trick play out can't use the
-        timing of the deal to infer anything about what's in other hands.
-        """
-        if self.phase != Phase.PHASE1_PLAY or self.trump_suit is not None:
-            raise ValueError("Trump reveal not applicable")
-        if seat != self.turn_seat:
-            raise ValueError("Not your turn")
-        hand = self.hands[seat]
-        if card not in hand:
-            raise ValueError("Card not in hand")
-        if not self.current_trick:
-            # Reveal is only ever triggered by being void when following, never
-            # while leading a trick.
-            raise ValueError("Cannot reveal trump while leading a trick")
+    def _mn_suits(self):
+        res={'A':[],'B':[]}
+        for seat,tricks in enumerate(self.taken):
+            team='A' if self.players[seat]['team']=='A' else 'B'
+            for trick in tricks:
+                for c in trick:
+                    if c['r']==10: res[team].append(c['s'])
+        return res
 
-        led = self.led_suit
-        has_led_suit = any(card_suit(c) == led for c in hand)
-        if has_led_suit:
-            raise ValueError("You can follow suit, cannot reveal trump")
-
-        # Step 1: lock the trump suit. Phase flips to PHASE2_PLAY immediately
-        # so normal follow-suit/trump-beats rules apply to the rest of this
-        # trick - but the boot deal itself is deferred (see boot_deal_pending).
-        self.trump_suit = card_suit(card)
-        self.trump_revealed_card = card
-        self.trump_revealer_seat = seat
-        self.phase = Phase.PHASE2_PLAY
-        self.boot_deal_pending = True
-
-        # This seat's void-in-led-suit status is locked in for the rest of
-        # THIS trick: even after receiving new boot cards that might include
-        # the led suit, they remain exempt from follow-suit for this trick.
-        self.trick_void_exempt_seats.add(seat)
-
-        # Step 2: immediately play the revealed card into the current trick.
-        hand.remove(card)
-        self.current_trick.append({"seat": seat, "card": card})
-
-        result = {
-            "type": "trump_revealed",
-            "seat": seat,
-            "card": card,
-            "trump_suit": self.trump_suit,
-        }
-
-        if len(self.current_trick) == 4:
-            # This reveal happened to be the trick's 4th card - resolve now.
-            # _resolve_trick() will see boot_deal_pending and deal there.
-            trick_result = self._resolve_trick()
-            result["trick_result"] = trick_result
-        else:
-            self.turn_seat = (self.turn_seat + 1) % 4
-
-        return result
-
-    def _resolve_trick(self) -> dict:
-        winner_seat = self._trick_winner()
-        cards_in_trick = [p["card"] for p in self.current_trick]
-        mendi_cards = [c for c in cards_in_trick if card_rank(c) == "10"]
-        if mendi_cards:
-            self.mendi_won[winner_seat] += len(mendi_cards)
-            for c in mendi_cards:
-                self.mendi_suits_won[winner_seat].append(card_suit(c))
-
-        self.trick_history.append({
-            "cards": list(self.current_trick),
-            "winner_seat": winner_seat,
-            "mendi_count": len(mendi_cards),
-        })
-
-        self.tricks_played += 1
-        self.current_trick = []
-        self.led_suit = None
-        self.turn_seat = winner_seat
-        self.leader_seat = winner_seat
-        self.trick_void_exempt_seats = set()  # exemptions only apply within one trick
-
-        trick_summary = {
-            "winner_seat": winner_seat,
-            "mendi_count": len(mendi_cards),
-        }
-
-        if self.boot_deal_pending:
-            # Trump was revealed at some point during this trick; the deal was
-            # deferred until now, so it happens only once the trick is fully
-            # finished (all 4 plays visible) rather than mid-trick.
-            self.boot_deal_pending = False
-            self._deal_phase2()
-            trick_summary["phase2_dealt"] = True
-        elif self.phase == Phase.PHASE1_PLAY and self.tricks_played == 5:
-            # Trump was NEVER revealed during the first 5 tricks -> no trump
-            # for the rest of the hand, and boot is dealt now regardless.
-            trick_summary["no_trump_locked"] = True
-            self._deal_phase2()
-            self.phase = Phase.PHASE2_PLAY
-            trick_summary["phase2_dealt"] = True
-
-        if self.tricks_played == 13:
-            self._finalize_hand()
-            trick_summary["hand_complete"] = True
-
-        return trick_summary
-
-    def _trick_winner(self) -> int:
-        led = self.led_suit
-        trump = self.trump_suit
-
-        def strength(play):
-            c = play["card"]
-            suit = card_suit(c)
-            rank = RANK_VALUE[card_rank(c)]
-            if trump and suit == trump:
-                return (2, rank)  # trump beats everything
-            if suit == led:
-                return (1, rank)
-            return (0, rank)  # can't win
-
-        best = max(self.current_trick, key=strength)
-        return best["seat"]
-
-    def _deal_phase2(self):
-        # boot has 32 cards, deal 8 to each seat
-        for s in range(4):
-            self.hands[s].extend(self.boot[s * 8:(s + 1) * 8])
-        self.boot = []
-
-    def _finalize_hand(self):
-        self.phase = Phase.HAND_COMPLETE
-        team_mendi = {"A": 0, "B": 0}
-        for seat, count in self.mendi_won.items():
-            team_mendi[self.team_of(seat)] += count
-        self.final_mendi = team_mendi
-        if team_mendi["A"] == team_mendi["B"]:
-            self.winner_team = "DRAW"
-        elif team_mendi["A"] > team_mendi["B"]:
-            self.winner_team = "A"
-        else:
-            self.winner_team = "B"
-
-    # ---------- serialization for clients ----------
-
-    def public_state(self, viewer_seat: Optional[int] = None) -> dict:
-        """State safe to send to a client: own hand only, everything else public."""
-        state = {
-            "phase": self.phase.value,
-            "trump_suit": self.trump_suit,
-            "trump_revealed_card": self.trump_revealed_card,
-            "trump_revealer_seat": self.trump_revealer_seat,
-            "current_trick": list(self.current_trick),
-            "led_suit": self.led_suit,
-            "turn_seat": self.turn_seat,
-            "tricks_played": self.tricks_played,
-            "mendi_won": dict(self.mendi_won),
-            "mendi_suits_won": {s: list(v) for s, v in self.mendi_suits_won.items()},
-            "hand_sizes": {s: len(h) for s, h in self.hands.items()},
-            "trick_void_exempt_seats": sorted(self.trick_void_exempt_seats),
-        }
-        if viewer_seat is not None:
-            state["your_hand"] = sorted(
-                self.hands[viewer_seat],
-                key=lambda c: (card_suit(c), RANK_VALUE[card_rank(c)]),
-            )
-            state["your_seat"] = viewer_seat
-        if self.phase == Phase.HAND_COMPLETE:
-            state["winner_team"] = self.winner_team
-            state["final_mendi"] = self.final_mendi
-        return state
-
-
-def bot_choose_card(hand_obj: "MendikotHand", seat: int) -> str:
-    """Simple bot policy: always play the lowest-ranked legal card.
-    If the bot is void and trump hasn't been revealed yet, it must reveal -
-    caller handles that case separately (see bot_take_turn)."""
-    legal = hand_obj.legal_moves(seat)
-    return min(legal, key=lambda c: RANK_VALUE[card_rank(c)])
-
-
-def bot_choose_reveal_card(hand_obj: "MendikotHand", seat: int) -> str:
-    """When a bot must reveal trump, it reveals its lowest card overall
-    (simple, non-strategic policy - matches 'plays lowest legal card')."""
-    hand = hand_obj.hands[seat]
-    return min(hand, key=lambda c: RANK_VALUE[card_rank(c)])
-
-
-"""Room management: lobby state, team-based seating, connection tracking, GC of stale rooms."""
-
-
-
-ROOM_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/I/1 ambiguity
-ROOM_TTL_SECONDS = 10 * 60  # GC empty/stale rooms after 10 min
-
-TEAM_SEATS = {"A": (0, 2), "B": (1, 3)}
-
-
-def gen_room_code(existing: set[str], length: int = 5) -> str:
-    while True:
-        code = "".join(random.choices(ROOM_CODE_CHARS, k=length))
-        if code not in existing:
-            return code
-
-
-@dataclass
-class Player:
-    player_id: str
-    name: str
-    seat: int
-    ws: Optional[WebSocket] = None
-    connected: bool = True
-    is_bot: bool = False
-
-
-@dataclass
-class Room:
-    code: str
-    players: dict[int, Player] = field(default_factory=dict)  # seat -> Player
-    hand: Optional[MendikotHand] = None
-    dealer_seat: int = 0
-    created_at: float = field(default_factory=time.time)
-    last_active: float = field(default_factory=time.time)
-    locked_until: float = 0.0  # monotonic time; no new plays accepted before this
-    cancelled: bool = False  # set once any player explicitly exits, or host leaves
-    is_solo: bool = False  # solo (vs bots) room - disconnect never matters, no cancel-on-leave
-
-    def touch(self):
-        self.last_active = time.time()
-
-    def lock_for(self, seconds: float):
-        self.locked_until = time.monotonic() + seconds
-
-    def is_locked(self) -> bool:
-        return time.monotonic() < self.locked_until
-
-    def is_full(self) -> bool:
-        return len(self.players) == 4
-
-    def team_of(self, seat: int) -> str:
-        return "A" if seat in TEAM_SEATS["A"] else "B"
-
-    def open_seat_for_team(self, team: str) -> Optional[int]:
-        for s in TEAM_SEATS.get(team, ()):
-            if s not in self.players:
-                return s
-        return None
-
-    def team_is_full(self, team: str) -> bool:
-        return self.open_seat_for_team(team) is None
-
-    def lobby_state(self) -> dict:
+    def state(self, seat=0):
+        ts=self.trump['s'] if self.tout else None
+        vp=[]
+        if self.whose==seat and not self.paused and not self.done:
+            vp=valid_plays(self.hands[seat],self.trick['led'],ts,self.ph1,self.tout)
         return {
-            "type": "room_update",
-            "room_code": self.code,
-            "seats": {
-                str(s): {
-                    "name": p.name,
-                    "connected": p.connected,
-                    "team": self.team_of(s),
-                    "is_bot": p.is_bot,
-                }
-                for s, p in self.players.items()
-            },
-            "team_full": {
-                "A": self.team_is_full("A"),
-                "B": self.team_is_full("B"),
-            },
-            "is_full": self.is_full(),
-            "host_seat": 0,
-            "game_in_progress": self.hand is not None and self.hand.phase.value != "HAND_COMPLETE",
+            'players':self.players,'hand':self.hands[seat],'trick':self.trick,
+            'tout':self.tout,'trump':self.trump if self.tout else None,
+            'whose':self.whose,'tnum':self.tnum,'ph1':self.ph1,'paused':self.paused,
+            'team_mn':self.team_mn,'opp_sizes':[len(self.hands[s]) for s in range(4)],
+            'vplays':vp,'must_reveal':bool(vp and all(c['mr'] for c in vp)),
+            'mendi_suits':self._mn_suits(),'done':self.done,
         }
 
-
-BOT_NAME_POOL = [
-    "Ravi", "Meera", "Sanjay", "Priya", "Arjun", "Divya", "Karan", "Anita",
-    "Vikram", "Neha", "Rohan", "Kavya", "Aman", "Sunita", "Deepak", "Pooja",
-]
-
-
-def gen_bot_name(existing: set[str]) -> str:
-    choices = [n for n in BOT_NAME_POOL if n not in existing]
-    pool = choices or BOT_NAME_POOL
-    return random.choice(pool)
-
-
-def gen_random_player_name() -> str:
-    return random.choice(BOT_NAME_POOL) + str(random.randint(10, 99))
-
-
-class RoomManager:
-    def __init__(self):
-        self.rooms: dict[str, Room] = {}
-
-    def create_room(self, host_name: str, host_player_id: str, team: str) -> tuple[Room, Player]:
-        code = gen_room_code(set(self.rooms.keys()))
-        room = Room(code=code)
-        seat = TEAM_SEATS[team][0]  # host always takes the first seat of their chosen team
-        player = Player(player_id=host_player_id, name=host_name, seat=seat)
-        room.players[seat] = player
-        self.rooms[code] = room
-        return room, player
-
-    def create_solo_room(self, host_name: str, host_player_id: str) -> tuple[Room, Player]:
-        """Instant single-player-vs-3-bots room. Host always seat 0."""
-        code = gen_room_code(set(self.rooms.keys()))
-        room = Room(code=code, is_solo=True)
-        player = Player(player_id=host_player_id, name=host_name, seat=0)
-        room.players[0] = player
-        used_names = {host_name}
-        for s in (1, 2, 3):
-            bname = gen_bot_name(used_names)
-            used_names.add(bname)
-            room.players[s] = Player(player_id=f"bot-{uuid.uuid4()}", name=bname, seat=s, is_bot=True, connected=True)
-        self.rooms[code] = room
-        return room, player
-
-    def join_room(self, code: str, name: str, player_id: str, team: str) -> tuple[Optional[Room], Optional[Player], Optional[str]]:
-        room = self.rooms.get(code)
-        if room is None:
-            return None, None, "ROOM_NOT_FOUND"
-
-        # reconnect case: same player_id already seated (e.g. brief network drop, not an explicit exit)
-        for p in room.players.values():
-            if p.player_id == player_id:
-                p.connected = True
-                room.touch()
-                return room, p, None
-
-        if room.is_full():
-            return None, None, "ROOM_FULL"
-
-        seat = room.open_seat_for_team(team)
-        if seat is None:
-            return None, None, "TEAM_FULL"
-
-        player = Player(player_id=player_id, name=name, seat=seat)
-        room.players[seat] = player
-        room.touch()
-        return room, player, None
-
-    def get_room(self, code: str) -> Optional[Room]:
-        return self.rooms.get(code)
-
-    def remove_stale_rooms(self):
-        now = time.time()
-        stale = [
-            code for code, r in self.rooms.items()
-            if now - r.last_active > ROOM_TTL_SECONDS
-        ]
-        for code in stale:
-            del self.rooms[code]
-        return stale
-
-    def mark_disconnected(self, room: Room, seat: int):
-        if seat in room.players:
-            room.players[seat].connected = False
-            room.players[seat].ws = None
-
-    def cancel_room(self, code: str):
-        if code in self.rooms:
-            del self.rooms[code]
-
-
-"""FastAPI WebSocket server for Mendikot. Orchestrates rooms + game engine."""
-
-
-
-app = FastAPI()
-manager = RoomManager()
-
-TRICK_PAUSE_SECONDS = 3.0  # how long a completed trick stays visible before clearing
-
-
-async def send_json(ws: WebSocket, payload: dict):
-    try:
-        await ws.send_text(json.dumps(payload))
-    except Exception:
-        pass
-
-
-async def broadcast(room, payload: dict, exclude_seat: int | None = None):
-    for seat, p in room.players.items():
-        if seat == exclude_seat or not p.connected or p.ws is None:
-            continue
-        await send_json(p.ws, payload)
-
-
-async def send_hand_state_to_all(room):
-    """Send each connected player their personalized game state."""
-    h = room.hand
-    for seat, p in room.players.items():
-        if not p.connected or p.ws is None:
-            continue
-        state = h.public_state(viewer_seat=seat)
-        await send_json(p.ws, {"type": "game_state", "state": state})
-
-
-async def start_new_hand(room):
-    room.hand = MendikotHand(dealer_seat=room.dealer_seat)
-    await send_hand_state_to_all(room)
-    await broadcast(room, {"type": "hand_started", "dealer_seat": room.dealer_seat})
-    await maybe_trigger_bot_turn(room)
-
-
-def rotate_dealer(room):
-    room.dealer_seat = (room.dealer_seat + 1) % 4
-
-
-async def cancel_room_and_notify(room, leaving_seat: int, reason: str = "player_left"):
-    """Cancel the room entirely and notify everyone still connected."""
-    room.cancelled = True
-    await broadcast(room, {
-        "type": "room_cancelled",
-        "reason": reason,
-        "leaving_seat": leaving_seat,
-    })
-    manager.cancel_room(room.code)
-
-
-BOT_THINK_SECONDS = 0.7  # small pause so the bot's move feels natural, not instant
-
-
-async def maybe_trigger_bot_turn(room):
-    """If it's currently a bot's turn (and the hand is in a playable state),
-    make that bot act after a short delay. Loops naturally: playing a card
-    triggers the same check again for the next turn_seat."""
-    h = room.hand
-    if h is None or room.cancelled:
-        return
-    if h.phase not in (Phase.PHASE1_PLAY, Phase.PHASE2_PLAY):
-        return
-    seat = h.turn_seat
-    player = room.players.get(seat)
-    if player is None or not player.is_bot:
-        return
-    if room.is_locked():
-        # a trick is mid-pause; re-check shortly after the pause window
-        asyncio.create_task(_delayed_bot_check(room, TRICK_PAUSE_SECONDS + 0.2))
-        return
-
-    await asyncio.sleep(BOT_THINK_SECONDS)
-    # Re-validate: room could've been cancelled or hand advanced during the sleep
-    if room.cancelled or room.hand is not h or h.turn_seat != seat:
-        return
-
-    legal = h.legal_moves(seat)
-    has_led = bool(h.current_trick) and any(
-        card_suit(c) == h.led_suit for c in h.hands[seat]
-    ) if h.current_trick else True
-
-    must_reveal = (
-        h.current_trick
-        and seat not in h.trick_void_exempt_seats
-        and h.phase == Phase.PHASE1_PLAY
-        and h.trump_suit is None
-        and not has_led
-    )
-
-    if must_reveal:
-        card = bot_choose_reveal_card(h, seat)
-        await do_reveal_trump(room, seat, card)
-    else:
-        card = bot_choose_card(h, seat)
-        await do_play_card(room, seat, card)
-
-
-async def _delayed_bot_check(room, delay: float):
-    await asyncio.sleep(delay)
-    await maybe_trigger_bot_turn(room)
-
-
-async def do_play_card(room, seat: int, card: str) -> Optional[str]:
-    """Shared play-card path for both human and bot actors.
-    Returns an error string on failure, or None on success (in which case
-    all broadcasting/state-sending/bot-chaining has already happened)."""
-    h = room.hand
-    try:
-        ev = h.play_card(seat, card)
-    except ValueError as e:
-        return str(e)
-
-    room.touch()
-    await broadcast(room, {"type": "card_played", "seat": ev["seat"], "card": ev["card"]})
-
-    if "trick_result" in ev:
-        tr = ev["trick_result"]
-        await broadcast(room, {
-            "type": "trick_won",
-            "winner_seat": tr["winner_seat"],
-            "mendi_count": tr["mendi_count"],
-            "no_trump_locked": tr.get("no_trump_locked", False),
-            "phase2_dealt": tr.get("phase2_dealt", False),
-        })
-        room.lock_for(TRICK_PAUSE_SECONDS)
-        await asyncio.sleep(TRICK_PAUSE_SECONDS)
-        await send_hand_state_to_all(room)
-
-        if tr.get("hand_complete"):
-            await broadcast(room, {
-                "type": "hand_complete",
-                "winner_team": h.winner_team,
-                "final_mendi": h.final_mendi,
-            })
-    else:
-        await send_hand_state_to_all(room)
-
-    if room.hand is h and h.phase != Phase.HAND_COMPLETE:
-        await maybe_trigger_bot_turn(room)
-    return None
-
-
-async def do_reveal_trump(room, seat: int, card: str) -> Optional[str]:
-    """Shared reveal-trump path for both human and bot actors."""
-    h = room.hand
-    try:
-        ev = h.reveal_trump(seat, card)
-    except ValueError as e:
-        return str(e)
-
-    room.touch()
-    await broadcast(room, {
-        "type": "trump_revealed",
-        "seat": ev["seat"],
-        "card": ev["card"],
-        "trump_suit": ev["trump_suit"],
-    })
-
-    if "trick_result" in ev:
-        tr = ev["trick_result"]
-        await broadcast(room, {
-            "type": "trick_won",
-            "winner_seat": tr["winner_seat"],
-            "mendi_count": tr["mendi_count"],
-            "no_trump_locked": tr.get("no_trump_locked", False),
-            "phase2_dealt": tr.get("phase2_dealt", False),
-        })
-        room.lock_for(TRICK_PAUSE_SECONDS)
-        await asyncio.sleep(TRICK_PAUSE_SECONDS)
-        await send_hand_state_to_all(room)
-
-        if tr.get("hand_complete"):
-            await broadcast(room, {
-                "type": "hand_complete",
-                "winner_team": h.winner_team,
-                "final_mendi": h.final_mendi,
-            })
-    else:
-        # Reveal didn't complete the trick - remaining players still need to
-        # play into it normally, no pause needed here.
-        await send_hand_state_to_all(room)
-
-    if room.hand is h and h.phase != Phase.HAND_COMPLETE:
-        await maybe_trigger_bot_turn(room)
-    return None
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    room = None
-    seat = None
-    player_id = None
-
-    try:
-        while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await send_json(ws, {"type": "error", "message": "Invalid JSON"})
-                continue
-
-            mtype = msg.get("type")
-
-            # ---------------- CREATE ROOM ----------------
-            if mtype == "create_room":
-                name = (msg.get("player_name") or "Host").strip()[:20] or "Host"
-                team = msg.get("team")
-                if team not in ("A", "B"):
-                    await send_json(ws, {"type": "error", "message": "Choose a team"})
-                    continue
-                player_id = str(uuid.uuid4())
-                room, player = manager.create_room(name, player_id, team)
-                player.ws = ws
-                seat = player.seat
-                await send_json(ws, {
-                    "type": "joined",
-                    "room_code": room.code,
-                    "player_id": player_id,
-                    "your_seat": seat,
-                })
-                await broadcast(room, room.lobby_state())
-
-            # ---------------- CREATE SOLO (instant vs 3 bots) ----------------
-            elif mtype == "create_solo":
-                name = (msg.get("player_name") or "").strip()[:20] or gen_random_player_name()
-                player_id = str(uuid.uuid4())
-                room, player = manager.create_solo_room(name, player_id)
-                player.ws = ws
-                seat = player.seat
-                await send_json(ws, {
-                    "type": "joined",
-                    "room_code": room.code,
-                    "player_id": player_id,
-                    "your_seat": seat,
-                    "solo": True,
-                })
-                await broadcast(room, room.lobby_state())
-                await start_new_hand(room)
-
-            # ---------------- JOIN ROOM ----------------
-            elif mtype == "join_room":
-                code = (msg.get("room_code") or "").strip().upper()
-                name = (msg.get("player_name") or "Player").strip()[:20] or "Player"
-                pid = msg.get("player_id") or str(uuid.uuid4())
-                team = msg.get("team")
-
-                # team is required for NEW joins, but not for reconnects (server
-                # already knows their seat/team from a prior join in this room)
-                existing_room = manager.get_room(code)
-                is_reconnect = existing_room is not None and any(
-                    p.player_id == pid for p in existing_room.players.values()
-                )
-                if not is_reconnect and team not in ("A", "B"):
-                    await send_json(ws, {"type": "error", "message": "Choose a team"})
-                    continue
-
-                r, player, err = manager.join_room(code, name, pid, team)
-                if err:
-                    await send_json(ws, {"type": "error", "message": err})
-                    continue
-
-                room = r
-                player.ws = ws
-                seat = player.seat
-                player_id = player.player_id
-
-                await send_json(ws, {
-                    "type": "joined",
-                    "room_code": room.code,
-                    "player_id": player_id,
-                    "your_seat": seat,
-                })
-                await broadcast(room, room.lobby_state())
-
-                # if game already in progress (reconnect case), resend state
-                if room.hand is not None:
-                    state = room.hand.public_state(viewer_seat=seat)
-                    await send_json(ws, {"type": "game_state", "state": state})
-
-            # ---------------- START GAME ----------------
-            elif mtype == "start_game":
-                if room is None:
-                    await send_json(ws, {"type": "error", "message": "Not in a room"})
-                    continue
-                if seat != 0:
-                    await send_json(ws, {"type": "error", "message": "Only host can start"})
-                    continue
-                if not room.is_full():
-                    await send_json(ws, {"type": "error", "message": "Room not full"})
-                    continue
-                await start_new_hand(room)
-
-            # ---------------- PLAY CARD ----------------
-            elif mtype == "play_card":
-                if room is None or room.hand is None:
-                    await send_json(ws, {"type": "error", "message": "No active hand"})
-                    continue
-                if room.is_locked():
-                    await send_json(ws, {"type": "error", "message": "Please wait, trick is still being shown"})
-                    continue
-                if seat != room.hand.turn_seat:
-                    await send_json(ws, {"type": "error", "message": "Not your turn"})
-                    continue
-                card = msg.get("card")
-                err = await do_play_card(room, seat, card)
-                if err == "VOID_MUST_REVEAL_TRUMP":
-                    await send_json(ws, {"type": "must_reveal_trump", "led_suit": room.hand.led_suit})
-                elif err:
-                    await send_json(ws, {"type": "error", "message": err})
-
-            # ---------------- REVEAL TRUMP ----------------
-            elif mtype == "reveal_trump":
-                if room is None or room.hand is None:
-                    await send_json(ws, {"type": "error", "message": "No active hand"})
-                    continue
-                if room.is_locked():
-                    await send_json(ws, {"type": "error", "message": "Please wait, trick is still being shown"})
-                    continue
-                if seat != room.hand.turn_seat:
-                    await send_json(ws, {"type": "error", "message": "Not your turn"})
-                    continue
-                card = msg.get("card")
-                err = await do_reveal_trump(room, seat, card)
-                if err:
-                    await send_json(ws, {"type": "error", "message": err})
-
-            # ---------------- EXIT GAME / LEAVE LOBBY ----------------
-            elif mtype == "exit_game":
-                if room is None or seat is None:
-                    await send_json(ws, {"type": "error", "message": "Not in a room"})
-                    continue
-                game_active = room.hand is not None and room.hand.phase != Phase.HAND_COMPLETE
-                if game_active:
-                    # Any player exiting mid-game cancels the room for everyone.
-                    await cancel_room_and_notify(room, seat, reason="player_left")
-                    room = None
-                    seat = None
-                elif seat == 0:
-                    # Host leaving the lobby (or a finished game screen) cancels the room.
-                    await cancel_room_and_notify(room, seat, reason="host_left")
-                    room = None
-                    seat = None
-                else:
-                    # Non-host leaving the lobby: just free their seat, room lives on.
-                    left_seat = seat
-                    if left_seat in room.players:
-                        del room.players[left_seat]
-                    room.touch()
-                    room_ref = room
-                    room = None
-                    seat = None
-                    await broadcast(room_ref, room_ref.lobby_state())
-
-            # ---------------- REMATCH ----------------
-            elif mtype == "rematch":
-                if room is None:
-                    await send_json(ws, {"type": "error", "message": "Not in a room"})
-                    continue
-                if seat != 0:
-                    await send_json(ws, {"type": "error", "message": "Only host can start rematch"})
-                    continue
-                if room.hand is None or room.hand.phase != Phase.HAND_COMPLETE:
-                    await send_json(ws, {"type": "error", "message": "Hand not complete"})
-                    continue
-                rotate_dealer(room)
-                await start_new_hand(room)
-
-            else:
-                await send_json(ws, {"type": "error", "message": f"Unknown message type: {mtype}"})
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        # A dropped connection (closed tab, lost network) is NOT the same as
-        # an explicit Exit tap - handled by seat/reason below. Explicit exits
-        # are handled entirely by the exit_game branch above, which already
-        # nulls out `room`/`seat` before we get here, so this block is a
-        # no-op for that case (avoids double-cancelling or cancelling an
-        # already-gone room).
-        if room is not None and seat is not None and not room.is_solo:
-            manager.mark_disconnected(room, seat)
-            if room.cancelled:
-                pass
-            else:
-                game_active = room.hand is not None and room.hand.phase != Phase.HAND_COMPLETE
-                if game_active:
-                    # Any player's connection dropping during an active game
-                    # cancels the room, same as an explicit exit would.
-                    await cancel_room_and_notify(room, seat, reason="player_left")
-                elif seat == 0:
-                    # Host disconnecting from the lobby cancels the room.
-                    await cancel_room_and_notify(room, seat, reason="host_left")
-                else:
-                    # Non-host disconnecting from the lobby: keep the room
-                    # alive, just show them as disconnected so the host can
-                    # decide whether to wait or the seat can be rejoined.
-                    await broadcast(room, room.lobby_state())
-
-
-async def gc_loop():
-    while True:
-        await asyncio.sleep(60)
-        manager.remove_stale_rooms()
-
-
-@app.on_event("startup")
-async def on_startup():
-    asyncio.create_task(gc_loop())
-
-
-# ---------------------------------------------------------------------------
-# Frontend - served as a single embedded HTML/CSS/JS page, no build step.
-# ---------------------------------------------------------------------------
-
-INDEX_HTML = """<!DOCTYPE html>
+    def play(self, seat, card, reveal=False):
+        evts=[]
+        if not reveal and not self.tout and self.ph1 and self.trick['led']:
+            if not any(c['s']==self.trick['led'] for c in self.hands[seat]): reveal=True
+        if reveal and not self.tout:
+            self.trump={'s':card['s'],'c':card,'by':seat,'by_name':self.players[seat]['name']}
+            self.tout=True; evts.append('trump_revealed')
+        self.hands[seat]=[c for c in self.hands[seat] if ckey(c)!=ckey(card)]
+        if not self.trick['led']: self.trick['led']=card['s']
+        self.trick['cards'].append({'seat':seat,'c':card})
+        if len(self.trick['cards'])==4: evts.append('trick_complete')
+        return evts
+
+    def resolve(self):
+        evts=[]; ts=self.trump['s'] if self.tout else None
+        ws=trick_win(self.trick['cards'],self.trick['led'],ts)
+        tc=[x['c'] for x in self.trick['cards']]; self.taken[ws].append(tc)
+        nm=sum(1 for c in tc if c['r']==10)
+        if nm:
+            self.seat_mn[ws]+=nm; self.team_mn[0]=self.seat_mn[0]+self.seat_mn[2]; self.team_mn[1]=self.seat_mn[1]+self.seat_mn[3]
+            evts.append(f"mendi:{self.players[ws]['name']}:{nm}")
+        self.tnum+=1
+        nb=not self.boot_dealt and ((self.tout and self.ph1) or (self.ph1 and self.tnum==5))
+        if nb:
+            self.boot_dealt=True; self.ph1=False
+            boot=shuf(self.boot)
+            for i in range(4): self.hands[i].extend(boot[i*8:(i+1)*8])
+            self.boot=[]; evts.append('boot_dealt')
+        if self.tnum==13:
+            self.done=True; evts.append('game_done'); return ws,evts
+        self.trick={'cards':[],'led':None}; self.paused=False; self.whose=ws
+        return ws,evts
+
+    def bot_card(self, seat):
+        ts=self.trump['s'] if self.tout else None
+        vp=valid_plays(self.hands[seat],self.trick['led'],ts,self.ph1,self.tout)
+        if not vp: return None,False
+        mr=all(c['mr'] for c in vp)
+        ch=min(vp,key=lambda c:c['r'])
+        return {'s':ch['s'],'r':ch['r']},mr
+
+HTML = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
-<title>Mendikot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Mendikot - Classic Indian Card Game</title>
+<meta name="description" content="Play Mendikot - the classic 4-player Indian card game. Capture the four 10s to win!">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,400;0,600;0,700;0,800;1,600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --felt: #35654d;
-    --felt-deep: #2a5140;
-    --felt-light: #3f7659;
-    --panel: #2e5c46;
-    --panel-2: #285039;
-    --gold: #D4A24C;
-    --gold-bright: #E8BE6E;
-    --cream: #F5EDE0;
-    --ink: #1C1410;
-    --teal-bright: #6FD9AC;
-    --red-suit: #C0453A;
-    --line: rgba(245,237,224,0.16);
-    --mine: var(--gold-bright);
-    --theirs: var(--teal-bright);
-  }
-
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-
-  body {
-    margin: 0;
-    height: 100vh;
-    height: 100dvh;
-    background: var(--felt);
-    font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    color: var(--cream);
-    overflow: hidden;
-  }
-
-  body.in-game { background: var(--felt); }
-
-  .display {
-    font-family: 'Open Sans', sans-serif;
-    font-weight: 800;
-  }
-  .ui { font-family: 'Open Sans', sans-serif; }
-
-  /* subtle felt weave texture, no shadow-based depth */
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    background-image:
-      repeating-linear-gradient(45deg, rgba(0,0,0,0.035) 0px, rgba(0,0,0,0.035) 1px, transparent 1px, transparent 13px),
-      repeating-linear-gradient(-45deg, rgba(255,255,255,0.02) 0px, rgba(255,255,255,0.02) 1px, transparent 1px, transparent 13px);
-    z-index: 0;
-  }
-
-  #app {
-    position: relative;
-    z-index: 1;
-    height: 100vh;
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  #view-menu, #view-create, #view-join, #view-room {
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  /* ---------------- LOBBY / HOME ---------------- */
-
-  .home-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 32px 20px;
-    gap: 26px;
-  }
-
-  .home-title {
-    font-size: 46px;
-    font-weight: 800;
-    letter-spacing: -0.5px;
-    color: var(--gold-bright);
-    margin: 0;
-    text-align: center;
-  }
-  .home-title .stamp-suits {
-    display: block;
-    font-size: 20px;
-    letter-spacing: 8px;
-    color: var(--cream);
-    opacity: 0.6;
-    margin-top: 8px;
-    font-weight: 400;
-  }
-
-  .home-card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 22px 6px 22px 6px;
-    padding: 26px;
-    width: 100%;
-    max-width: 380px;
-  }
-  .home-card + .home-card { margin-top: 4px; }
-
-  .field-label {
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--gold);
-    display: block;
-    margin-bottom: 8px;
-  }
-
-  input[type=text] {
-    width: 100%;
-    padding: 13px 14px;
-    border-radius: 14px 4px 14px 4px;
-    border: 1px solid var(--line);
-    background: var(--panel-2);
-    color: var(--cream);
-    font-size: 16px;
-    font-family: 'Open Sans', sans-serif;
-    outline: none;
-    margin-bottom: 16px;
-  }
-  input[type=text]:focus { border-color: var(--gold); }
-  input[type=text]::placeholder { color: rgba(245,237,224,0.35); }
-  input#join-code { text-transform: uppercase; letter-spacing: 3px; text-align: center; font-size: 20px; font-weight: 700; }
-
-  button {
-    font-family: 'Open Sans', sans-serif;
-    cursor: pointer;
-    border: none;
-    font-weight: 700;
-    letter-spacing: 0.2px;
-    transition: transform 0.08s ease, filter 0.15s ease;
-  }
-  button:active { transform: scale(0.97); }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .btn-primary {
-    width: 100%;
-    padding: 15px;
-    background: var(--gold-bright);
-    color: var(--ink);
-    font-size: 16px;
-    border-radius: 16px 5px 16px 5px;
-  }
-  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
-
-  .btn-secondary {
-    width: 100%;
-    padding: 15px;
-    background: transparent;
-    border: 1.5px solid var(--teal-bright);
-    color: var(--teal-bright);
-    font-size: 16px;
-    border-radius: 16px 5px 16px 5px;
-  }
-  .btn-secondary:hover:not(:disabled) { background: rgba(111,217,172,0.12); }
-
-  .btn-solo {
-    width: 100%;
-    padding: 18px;
-    background: var(--gold-bright);
-    color: var(--ink);
-    font-size: 17px;
-    border-radius: 26px 6px 26px 6px;
-  }
-  .btn-solo .btn-solo-sub {
-    display: block;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    opacity: 0.6;
-    margin-top: 3px;
-  }
-  .btn-friends {
-    width: 100%;
-    padding: 18px;
-    background: transparent;
-    border: 1.5px solid var(--teal-bright);
-    color: var(--teal-bright);
-    font-size: 17px;
-    border-radius: 6px 26px 6px 26px;
-  }
-  .btn-friends .btn-friends-sub {
-    display: block;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    opacity: 0.65;
-    margin-top: 3px;
-  }
-
-  .menu-buttons {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    width: 100%;
-    max-width: 340px;
-  }
-
-  .screen-title {
-    font-size: 24px;
-    font-weight: 800;
-    color: var(--gold-bright);
-    margin: 0 0 4px;
-    text-align: center;
-  }
-
-  .back-link {
-    background: none;
-    border: none;
-    color: rgba(245,237,224,0.55);
-    font-size: 14px;
-    font-weight: 600;
-    align-self: flex-start;
-    padding: 4px 0;
-    margin-bottom: 4px;
-  }
-  .back-link:hover { color: var(--cream); }
-
-  .team-picker {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 18px;
-  }
-  .team-btn {
-    flex: 1;
-    padding: 14px 8px;
-    background: rgba(245,237,224,0.04);
-    border: 1.5px solid rgba(245,237,224,0.18);
-    border-radius: 12px 3px 12px 3px;
-    color: rgba(245,237,224,0.7);
-    font-size: 14px;
-    font-weight: 700;
-    transition: all 0.15s ease;
-  }
-  .team-btn.team-a.selected {
-    border-color: var(--gold);
-    background: rgba(212,162,76,0.16);
-    color: var(--gold-bright);
-    box-shadow: 0 0 0 1px var(--gold) inset;
-  }
-  .team-btn.team-b.selected {
-    border-color: var(--teal-bright);
-    background: rgba(111,217,172,0.14);
-    color: var(--teal-bright);
-    box-shadow: 0 0 0 1px var(--teal-bright) inset;
-  }
-  .team-btn.full { opacity: 0.35; cursor: not-allowed; }
-  .team-btn:disabled { cursor: not-allowed; }
-
-  .exit-link {
-    background: none;
-    border: none;
-    color: rgba(245,237,224,0.4);
-    font-size: 13px;
-    font-weight: 600;
-    margin-top: 18px;
-    padding: 6px;
-  }
-  .exit-link:hover { color: var(--red-suit); }
-
-  .exit-icon-btn {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    z-index: 20;
-    width: 30px;
-    height: 30px;
-    border-radius: 50% 8px 50% 8px;
-    background: rgba(0,0,0,0.25);
-    border: none;
-    color: rgba(245,237,224,0.6);
-    font-size: 20px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-  }
-  .exit-icon-btn:hover { background: rgba(166,54,44,0.5); color: var(--cream); }
-
-  .confirm-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(20,40,30,0.82);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 90;
-    padding: 20px;
-  }
-  .confirm-overlay.show { display: flex; animation: fadeIn 0.2s ease; }
-  .confirm-card {
-    background: var(--panel);
-    border-radius: 20px 6px 20px 6px;
-    padding: 28px 24px;
-    max-width: 320px;
-    width: 100%;
-    text-align: center;
-  }
-  .confirm-text {
-    font-size: 15px;
-    color: var(--cream);
-    margin-bottom: 20px;
-    line-height: 1.4;
-  }
-  .confirm-buttons { display: flex; gap: 10px; }
-  .confirm-buttons button { flex: 1; padding: 12px; font-size: 14px; border-radius: 12px 4px 12px 4px; }
-  .btn-danger { background: var(--red-suit); color: var(--cream); }
-
-  .error-banner {
-    background: rgba(166,54,44,0.25);
-    border: 1px solid var(--red-suit);
-    color: #FFD9D4;
-    padding: 10px 14px;
-    border-radius: 10px 3px 10px 3px;
-    font-size: 14px;
-    margin-bottom: 14px;
-    display: none;
-  }
-  .error-banner.show { display: block; }
-
-  /* ---------------- ROOM / WAITING ---------------- */
-
-  .room-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 40px 20px;
-    gap: 24px;
-  }
-
-  .room-code-display { text-align: center; }
-  .room-code-display .label {
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    color: rgba(245,237,224,0.55);
-    margin-bottom: 10px;
-  }
-  .room-code-display .code {
-    font-size: 44px;
-    font-weight: 800;
-    letter-spacing: 9px;
-    color: var(--gold-bright);
-    background: var(--panel);
-    border: 1px solid var(--line);
-    padding: 14px 20px 14px 30px;
-    border-radius: 20px 5px 20px 5px;
-    display: inline-block;
-  }
-  .copy-hint {
-    font-size: 13px;
-    color: rgba(245,237,224,0.5);
-    margin-top: 10px;
-    cursor: pointer;
-  }
-  .copy-hint:hover { color: var(--gold); }
-
-  .seats-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    width: 100%;
-    max-width: 420px;
-  }
-  .seat-slot {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 16px 4px 16px 4px;
-    padding: 16px;
-    text-align: center;
-    position: relative;
-  }
-  .seat-slot.team-a { border-left: 3px solid var(--gold); }
-  .seat-slot.team-b { border-left: 3px solid var(--teal-bright); }
-  .seat-slot.empty { opacity: 0.4; border-style: dashed; }
-  .seat-slot .seat-name { font-size: 16px; font-weight: 700; }
-  .seat-slot .seat-team {
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    opacity: 0.6;
-    margin-top: 4px;
-  }
-  .seat-slot .disconnected-badge {
-    position: absolute;
-    top: 8px; right: 8px;
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: #A6362C;
-  }
-  .seat-slot .you-badge {
-    font-size: 9px;
-    font-weight: 700;
-    color: var(--gold);
-    letter-spacing: 1px;
-    margin-top: 2px;
-  }
-
-  .waiting-note { font-size: 14px; color: rgba(245,237,224,0.6); text-align: center; }
-
-  /* ---------------- GAME TABLE (vertical stack) ---------------- */
-
-  .table-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    max-width: 640px;
-    width: 100%;
-    margin: 0 auto;
-    padding: clamp(6px, 1.6vh, 10px) clamp(6px, 2vw, 10px);
-    min-height: 0;
-    overflow: hidden;
-    position: relative;
-  }
-
-  .game-vertical-layout {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    gap: clamp(4px, 1vh, 8px);
-  }
-
-  /* score cluster: fixed at the very top */
-  .score-cluster {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: clamp(10px, 3vw, 22px);
-    flex-shrink: 0;
-    padding: clamp(4px, 1vh, 8px) 4px;
-  }
-
-  .score-side {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-  }
-  .score-side-label {
-    font-size: 9px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: rgba(245,237,224,0.5);
-  }
-  .score-side.mine .score-side-label { color: rgba(232,190,110,0.8); }
-  .score-side.theirs .score-side-label { color: rgba(111,217,172,0.75); }
-
-  .score-side-body {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .score-side.theirs .score-side-body { flex-direction: row-reverse; }
-
-  .earn-count {
-    font-family: 'Open Sans', sans-serif;
-    font-weight: 800;
-    font-size: clamp(18px, 5vw, 24px);
-    line-height: 1;
-    color: var(--cream);
-    min-width: 22px;
-    text-align: center;
-    transition: transform 0.2s cubic-bezier(.2,1.4,.4,1);
-  }
-  .score-side.mine .earn-count { color: var(--gold-bright); }
-  .score-side.theirs .earn-count { color: var(--teal-bright); }
-  .earn-count.bump { animation: earnBump 0.4s cubic-bezier(.2,1.4,.4,1); }
-  @keyframes earnBump {
-    0% { transform: scale(1); }
-    40% { transform: scale(1.45); }
-    100% { transform: scale(1); }
-  }
-
-  .ten-slots { display: flex; gap: clamp(2px, 0.8vw, 4px); }
-  .ten-slot {
-    width: clamp(15px, 3.6vw, 19px);
-    height: clamp(21px, 5.2vw, 27px);
-    border-radius: 5px 2px 5px 2px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-weight: 800;
-    font-size: 8px;
-    line-height: 1;
-    background: rgba(0,0,0,0.16);
-    color: rgba(245,237,224,0.18);
-  }
-  .ten-slot .ts-suit { font-size: clamp(9px, 2.2vw, 11px); line-height: 1; }
-  .ten-slot.won { background: var(--cream); animation: mendiWon 0.5s cubic-bezier(.2,1.4,.4,1); }
-  @keyframes mendiWon {
-    0% { transform: translateY(6px) scale(0.6) rotate(-10deg); opacity: 0; }
-    60% { transform: translateY(-4px) scale(1.15) rotate(4deg); opacity: 1; }
-    100% { transform: translateY(0) scale(1) rotate(0deg); }
-  }
-  .ten-slot.won.red { color: var(--red-suit); }
-  .ten-slot.won.black { color: var(--ink); }
-
-  .trump-card-box {
-    width: clamp(28px, 6.8vw, 36px);
-    height: clamp(39px, 9.6vw, 50px);
-    border-radius: 9px 3px 9px 3px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: clamp(15px, 3.6vw, 20px);
-    background: rgba(0,0,0,0.18);
-    color: rgba(245,237,224,0.3);
-    font-weight: 800;
-    flex-shrink: 0;
-  }
-  .trump-card-box.revealed {
-    background: var(--cream);
-    animation: trumpLockIn 0.5s cubic-bezier(.2,1.4,.4,1);
-  }
-  @keyframes trumpLockIn {
-    0% { transform: scale(1.6) rotate(-6deg); opacity: 0.3; }
-    60% { transform: scale(0.92) rotate(3deg); }
-    100% { transform: scale(1) rotate(0deg); }
-  }
-  .trump-card-box.revealed.red { color: var(--red-suit); }
-  .trump-card-box.revealed.black { color: var(--ink); }
-
-  /* table felt: middle section, flexible height */
-  .table-felt {
-    flex: 1;
-    background: transparent;
-    border-radius: 0;
-    border: none;
-    position: relative;
-    min-height: 0;
-    display: grid;
-    grid-template-areas:
-      ".    top    ."
-      "left center right"
-      ".    bottom .";
-    grid-template-columns: clamp(44px, 15vw, 64px) 1fr clamp(44px, 15vw, 64px);
-    grid-template-rows: clamp(30px, 8vh, 44px) 1fr clamp(30px, 8vh, 44px);
-    padding: clamp(4px, 1vh, 8px) clamp(2px, 1vw, 6px);
-    gap: 3px;
-  }
-
-  .seat-marker {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-  }
-  .seat-marker .seat-mini-name {
-    font-size: 12px;
-    font-weight: 700;
-    color: rgba(245,237,224,0.75);
-    white-space: nowrap;
-    max-width: 80px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    transition: color 0.25s ease;
-  }
-  .seat-marker .bot-badge {
-    font-size: 8px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: rgba(245,237,224,0.4);
-  }
-  .seat-marker .turn-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--gold-bright);
-    opacity: 0;
-    transform: scale(0.5);
-    transition: opacity 0.25s ease, transform 0.25s ease;
-  }
-  .seat-marker.active .seat-mini-name { color: var(--gold-bright); }
-  .seat-marker.active .turn-dot {
-    opacity: 1;
-    transform: scale(1);
-    animation: turnPulse 1.4s ease-in-out infinite;
-  }
-  @keyframes turnPulse {
-    0%, 100% { transform: scale(1); opacity: 1; }
-    50% { transform: scale(1.4); opacity: 0.6; }
-  }
-  .seat-marker.disconnected .seat-mini-name { opacity: 0.35; text-decoration: line-through; }
-  .seat-marker.top { grid-area: top; }
-  .seat-marker.left { grid-area: left; }
-  .seat-marker.right { grid-area: right; }
-  .seat-marker.bottom-marker { grid-area: bottom; }
-
-  .trick-center {
-    position: relative;
-    flex: 1;
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 0;
-  }
-  .trick-slot {
-    position: absolute;
-    width: clamp(36px, 8.5vw, 44px);
-    height: clamp(50px, 12vw, 61px);
-  }
-  .trick-slot.pos-top { top: 0; left: 50%; transform: translateX(-50%); }
-  .trick-slot.pos-left { left: 0; top: 50%; transform: translateY(-50%); }
-  .trick-slot.pos-right { right: 0; top: 50%; transform: translateY(-50%); }
-  .trick-slot.pos-bottom { bottom: 0; left: 50%; transform: translateX(-50%); }
-
-  /* card pop-in: trick cards only, plays from the direction of the thrower */
-  @keyframes cardPopBottom { 0% { transform: translateY(28px) scale(0.7); opacity: 0; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
-  @keyframes cardPopTop    { 0% { transform: translateY(-28px) scale(0.7); opacity: 0; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
-  @keyframes cardPopLeft   { 0% { transform: translateX(-28px) scale(0.7); opacity: 0; } 100% { transform: translateX(0) scale(1); opacity: 1; } }
-  @keyframes cardPopRight  { 0% { transform: translateX(28px) scale(0.7); opacity: 0; } 100% { transform: translateX(0) scale(1); opacity: 1; } }
-  .trick-slot.pos-bottom .pcard { animation: cardPopBottom 0.24s cubic-bezier(.2,1.4,.4,1); }
-  .trick-slot.pos-top .pcard    { animation: cardPopTop 0.24s cubic-bezier(.2,1.4,.4,1); }
-  .trick-slot.pos-left .pcard   { animation: cardPopLeft 0.24s cubic-bezier(.2,1.4,.4,1); }
-  .trick-slot.pos-right .pcard  { animation: cardPopRight 0.24s cubic-bezier(.2,1.4,.4,1); }
-
-  /* trick collection: cards slide/fade off toward the winning side's earn-count */
-  .trick-slot.collect-mine { animation: collectToMine 0.42s ease-in forwards; }
-  .trick-slot.collect-theirs { animation: collectToTheirs 0.42s ease-in forwards; }
-  @keyframes collectToMine {
-    0% { transform: translate(0,0) scale(1); opacity: 1; }
-    100% { transform: translate(calc(-50vw + 40px), calc(-50vh + 20px)) scale(0.25); opacity: 0; }
-  }
-  @keyframes collectToTheirs {
-    0% { transform: translate(0,0) scale(1); opacity: 1; }
-    100% { transform: translate(calc(50vw - 40px), calc(-50vh + 20px)) scale(0.25); opacity: 0; }
-  }
-
-  /* playing card */
-  .pcard {
-    width: clamp(36px, 8.5vw, 44px);
-    height: clamp(50px, 12vw, 61px);
-    background: var(--cream);
-    border-radius: 8px 3px 8px 3px;
-    box-shadow: none;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    padding: 3px 4px;
-    font-weight: 800;
-    position: relative;
-    flex-shrink: 0;
-  }
-  .pcard.red { color: var(--red-suit); }
-  .pcard.black { color: var(--ink); }
-  .pcard .pcard-rank { font-size: 12px; line-height: 1; }
-  .pcard .pcard-suit-big {
-    position: absolute;
-    top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    font-size: 19px;
-    opacity: 0.85;
-  }
-  .pcard .pcard-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-
-  .pcard.trump-marked::after {
-    content: "";
-    position: absolute;
-    top: 2px; right: 2px;
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--gold);
-  }
-
-  .pcard.face-down {
-    background: repeating-linear-gradient(135deg, var(--panel-2) 0 4px, var(--panel) 4px 8px);
-    border: 1px solid var(--gold);
-  }
-
-  /* ---------------- hand strip (bottom, never scrolls) ---------------- */
-  .hand-strip-wrap {
-    flex-shrink: 0;
-    padding: clamp(2px, 0.8vh, 6px) 2px 2px;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-  }
-
-  .hand-strip {
-    display: flex;
-    justify-content: center;
-    align-items: flex-end;
-    flex-wrap: nowrap;
-    gap: 0;
-    padding: 2px 4px 4px;
-    overflow: hidden;
-    min-height: 0;
-  }
-  .hand-card {
-    /* sized and spaced dynamically via inline style/JS based on hand count
-       and viewport, so every card in a 13-card hand fits without scrolling */
-    background: var(--cream);
-    border-radius: 10px 4px 10px 4px;
-    box-shadow: none;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    padding: 5px 5px;
-    font-weight: 800;
-    cursor: pointer;
-    transition: transform 0.12s ease, z-index 0s;
-    position: relative;
-    flex-shrink: 0;
-  }
-  .hand-card.red { color: var(--red-suit); }
-  .hand-card.black { color: var(--ink); }
-  .hand-card .hc-rank { font-size: 14px; line-height: 1; }
-  .hand-card .hc-suit-big {
-    position: absolute;
-    top: 50%; left: 50%;
-    transform: translate(-50%,-50%);
-    font-size: 22px;
-    opacity: 0.85;
-  }
-  .hand-card .hc-rank.bottom { align-self: flex-end; transform: rotate(180deg); }
-  .hand-card:hover { transform: translateY(-10px); z-index: 5; }
-  .hand-card.playable:hover { transform: translateY(-12px); }
-  .hand-card.disabled { opacity: 0.4; cursor: not-allowed; }
-  .hand-card.disabled:hover { transform: none; }
-  .hand-card.trump-marked { outline: 2px solid var(--gold); outline-offset: -2px; }
-  .hand-card.selected-for-reveal { outline: 3px solid var(--gold-bright); outline-offset: -3px; transform: translateY(-10px); }
-
-  .action-bar { text-align: center; padding: 4px 0 2px; min-height: 34px; }
-  .reveal-btn {
-    padding: 10px 22px;
-    background: var(--gold-bright);
-    color: var(--ink);
-    border-radius: 22px 7px 22px 7px;
-    font-size: 14px;
-  }
-
-  /* trump reveal flash overlay - suit flash kept, no toast/prompt text */
-  .trump-flash {
-    position: fixed;
-    inset: 0;
-    background: rgba(20,40,30,0.75);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 50;
-  }
-  .trump-flash.show { display: flex; animation: fadeIn 0.2s ease; }
-  .trump-flash .stamp {
-    width: 122px;
-    height: 170px;
-    border-radius: 20px 6px 20px 6px;
-    background: var(--cream);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 82px;
-    animation: stampIn 0.4s cubic-bezier(.2,1.4,.4,1);
-  }
-  .trump-flash .stamp.red { color: var(--red-suit); }
-  .trump-flash .stamp.black { color: var(--ink); }
-  @keyframes stampIn {
-    0% { transform: scale(2.2) rotate(-8deg); opacity: 0; }
-    60% { transform: scale(0.95) rotate(2deg); opacity: 1; }
-    100% { transform: scale(1) rotate(0deg); opacity: 1; }
-  }
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
-  /* hand complete overlay */
-  .result-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(15,30,22,0.9);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 60;
-    padding: 20px;
-  }
-  .result-overlay.show { display: flex; animation: fadeIn 0.25s ease; }
-  .result-card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 24px 8px 24px 8px;
-    padding: 36px 30px;
-    text-align: center;
-    max-width: 340px;
-    width: 100%;
-  }
-  .result-headline { font-size: 28px; font-weight: 800; color: var(--gold-bright); margin: 0 0 6px; }
-  .result-headline.draw { color: rgba(245,237,224,0.75); }
-  .result-sub { font-size: 14px; color: rgba(245,237,224,0.6); margin-bottom: 22px; }
-  .result-mendi-row { display: flex; justify-content: center; gap: 24px; margin-bottom: 26px; }
-  .result-mendi-row .mendi-counter { display: flex; flex-direction: column; align-items: center; gap: 8px; }
-  .result-mendi-row .mendi-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; opacity: 0.6; }
-  .result-mendi-row .ten-slots { gap: 5px; }
-  .result-mendi-row .ten-slot { width: 24px; height: 33px; font-size: 9px; }
-  .result-mendi-row .ten-slot .ts-suit { font-size: 14px; }
-
-  .toast {
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--panel);
-    border: 1px solid var(--red-suit);
-    color: var(--cream);
-    padding: 12px 20px;
-    border-radius: 18px 6px 18px 6px;
-    font-size: 13px;
-    z-index: 100;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s ease;
-  }
-  .toast.show { opacity: 1; }
-
-  .hidden { display: none !important; }
-
-  @media (max-width: 380px) {
-    .home-title { font-size: 38px; }
-    .room-code-display .code { font-size: 34px; letter-spacing: 6px; }
-  }
-
-  @media (max-height: 420px) {
-    .table-felt {
-      grid-template-columns: clamp(32px, 10vw, 46px) 1fr clamp(32px, 10vw, 46px);
-      grid-template-rows: clamp(24px, 10vh, 34px) 1fr clamp(24px, 10vh, 34px);
-    }
-    .ten-slot { width: 13px; height: 18px; }
-    .trump-card-box { width: 24px; height: 33px; font-size: 13px; }
-    .score-side-label { font-size: 8px; }
-    .earn-count { font-size: 15px; }
-    .action-bar { min-height: 24px; padding: 2px 0; }
-  }
-
-  @media (min-width: 900px) {
-    .table-wrap { max-width: 720px; }
-  }
+:root{--g0:#030f06;--g1:#0a2b14;--g2:#10431f;--g3:#1a6b35;--gold:#d4af37;--gold2:#f5d86e;--gold3:#a07c1e;--red:#c0392b;--dark:#1a1a2e;--txt:#f0e6d3;--muted:rgba(240,230,211,.6);--bdr:rgba(212,175,55,.22);--bdrS:rgba(212,175,55,.6);--panel:rgba(6,20,10,.94);--glass:rgba(14,60,30,.5);--sh1:0 4px 14px rgba(0,0,0,.55);--sh2:0 10px 32px rgba(0,0,0,.65);--sh3:0 20px 56px rgba(0,0,0,.8);--r1:8px;--r2:12px;--r3:20px;--rc:9px;--tf:140ms ease;--tm:280ms cubic-bezier(.4,0,.2,1);--ts:500ms cubic-bezier(.34,1.56,.64,1)}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:var(--g0);color:var(--txt);user-select:none;-webkit-user-select:none}
+body{background:radial-gradient(ellipse 110% 55% at 50% 0%,rgba(39,174,96,.1),transparent 68%),radial-gradient(ellipse 70% 70% at 50% 105%,rgba(0,0,0,.5),transparent 68%),linear-gradient(175deg,#051209,#0a2b14 45%,#07200f)}
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='.04'/%3E%3C/svg%3E")}
+#app{position:relative;z-index:1;height:100%;display:flex;flex-direction:column}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;padding:.85rem 1.6rem;border:none;border-radius:var(--r2);font-family:'Inter',sans-serif;font-size:.93rem;font-weight:600;cursor:pointer;transition:all var(--tm);position:relative;overflow:hidden;letter-spacing:.03em}
+.btn:active{transform:scale(.96)}
+.btn-gold{background:linear-gradient(135deg,var(--gold2),var(--gold) 50%,var(--gold3));color:#180700;font-weight:700;box-shadow:0 4px 22px rgba(212,175,55,.35)}
+.btn-gold:hover{transform:translateY(-2px);box-shadow:0 8px 36px rgba(212,175,55,.55)}
+.btn-ghost{background:var(--glass);color:var(--txt);border:1px solid var(--bdr);backdrop-filter:blur(10px)}
+.btn-ghost:hover{background:rgba(39,174,96,.22);border-color:var(--bdrS);transform:translateY(-2px)}
+.btn-w{width:100%}.btn-sm{padding:.52rem 1.1rem;font-size:.8rem;border-radius:var(--r1)}
+.btn-ico{width:20px;height:20px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:2}
+.back-btn{display:inline-flex;align-items:center;gap:.4rem;background:rgba(0,0,0,.25);border:1px solid var(--bdr);border-radius:var(--r1);padding:.38rem .8rem;color:var(--muted);font-size:.78rem;font-weight:600;cursor:pointer;transition:all var(--tf)}.back-btn:hover{color:var(--txt)}
+.flbl{display:block;font-size:.7rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gold);margin-bottom:.32rem}
+.finp{width:100%;padding:.7rem 1rem;background:rgba(0,0,0,.28);border:1px solid var(--bdr);border-radius:var(--r1);color:var(--txt);font-family:'Inter',sans-serif;font-size:.93rem;outline:none;transition:border-color var(--tf),box-shadow var(--tf)}
+.finp:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(212,175,55,.16)}.finp::placeholder{color:var(--muted)}
+.menu-v{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem 1.5rem;gap:1.6rem;overflow-y:auto}
+.brand{display:flex;flex-direction:column;align-items:center;gap:.55rem}
+.chip{width:86px;height:86px;border-radius:50%;background:conic-gradient(var(--gold) 0 36deg,var(--g0) 36deg 72deg,var(--gold) 72deg 108deg,var(--g0) 108deg 144deg,var(--gold) 144deg 180deg,var(--g0) 180deg 216deg,var(--gold) 216deg 252deg,var(--g0) 252deg 288deg,var(--gold) 288deg 324deg,var(--g0) 324deg 360deg);border:4px solid var(--gold);display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 2px var(--g0),0 0 28px rgba(212,175,55,.45),var(--sh2);animation:chipSpin 28s linear infinite;flex-shrink:0}
+.chip-in{width:56px;height:56px;border-radius:50%;background:var(--g0);border:3px solid var(--gold);display:flex;align-items:center;justify-content:center;font-family:'Playfair Display',serif;font-size:1.55rem;font-weight:900;color:var(--gold)}
+@keyframes chipSpin{to{transform:rotate(360deg)}}
+.brand-t{font-family:'Playfair Display',serif;font-size:clamp(2.6rem,11vw,4.2rem);font-weight:900;background:linear-gradient(135deg,var(--gold2),var(--gold) 50%,var(--gold3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:.08em;line-height:1;animation:gPulse 4s ease-in-out infinite alternate}
+@keyframes gPulse{from{filter:drop-shadow(0 0 8px rgba(212,175,55,.3))}to{filter:drop-shadow(0 0 22px rgba(212,175,55,.7))}}
+.brand-s{font-size:.7rem;color:var(--muted);letter-spacing:.24em;text-transform:uppercase}
+.card-fan{position:relative;width:158px;height:78px;flex-shrink:0}
+.fc{position:absolute;bottom:0;width:46px;height:64px;border-radius:6px;background:#fff;box-shadow:var(--sh2);display:flex;align-items:center;justify-content:center;font-size:1.4rem;transform-origin:bottom center;transition:transform var(--tm)}
+.fc:nth-child(1){left:0;transform:rotate(-22deg);z-index:1}.fc:nth-child(2){left:28px;transform:rotate(-11deg);z-index:2}.fc:nth-child(3){left:56px;transform:rotate(0);z-index:3}.fc:nth-child(4){left:84px;transform:rotate(11deg);z-index:2}.fc:nth-child(5){left:112px;transform:rotate(22deg);z-index:1}
+.card-fan:hover .fc:nth-child(1){transform:rotate(-28deg) translateY(-8px)}.card-fan:hover .fc:nth-child(2){transform:rotate(-14deg) translateY(-11px)}.card-fan:hover .fc:nth-child(3){transform:rotate(0) translateY(-15px)}.card-fan:hover .fc:nth-child(4){transform:rotate(14deg) translateY(-11px)}.card-fan:hover .fc:nth-child(5){transform:rotate(28deg) translateY(-8px)}
+.menu-form{width:100%;max-width:295px}.menu-btns{display:flex;flex-direction:column;gap:.7rem;width:100%;max-width:295px}
+.hub-v{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem 1.5rem;gap:1.75rem;position:relative}
+.view-t{font-family:'Playfair Display',serif;font-size:clamp(1.5rem,7vw,2.1rem);color:var(--gold);text-align:center}
+.hub-row{display:flex;gap:.9rem;width:100%;max-width:350px}
+.hub-c{flex:1;background:var(--glass);border:1px solid var(--bdr);border-radius:var(--r3);padding:1.4rem .9rem;display:flex;flex-direction:column;align-items:center;gap:.7rem;cursor:pointer;transition:all var(--tm);backdrop-filter:blur(12px)}
+.hub-c:hover{background:rgba(39,174,96,.2);border-color:var(--bdrS);transform:translateY(-5px);box-shadow:0 16px 48px rgba(0,0,0,.35)}
+.hub-ico{width:52px;height:52px;border-radius:50%;background:rgba(212,175,55,.1);border:1px solid var(--bdr);display:flex;align-items:center;justify-content:center;color:var(--gold)}
+.hub-ct{font-weight:700;font-size:.95rem;text-align:center}.hub-cd{font-size:.73rem;color:var(--muted);text-align:center}
+.form-v{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem 1.5rem;gap:1.4rem;position:relative}
+.fpanel{width:100%;max-width:350px;background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r3);padding:1.9rem 1.7rem;backdrop-filter:blur(20px);display:flex;flex-direction:column;gap:1.2rem}
+.card{width:100%;height:100%;background:#fefefe;border-radius:var(--rc);border:1px solid #ddd;box-shadow:var(--sh1);display:flex;flex-direction:column;padding:3px;position:relative;cursor:default;transition:transform var(--tm),box-shadow var(--tm);will-change:transform}
+.card.play{cursor:pointer}.card.play:hover{transform:translateY(-11px) scale(1.08);box-shadow:var(--sh3),0 0 0 2px rgba(212,175,55,.4);z-index:100}
+.card.dis{opacity:.35;filter:saturate(.18);cursor:default}.card.istr{box-shadow:var(--sh1),0 0 14px rgba(212,175,55,.6)}.card.ismn{box-shadow:var(--sh1),0 0 10px rgba(212,175,55,.45)}
+.card.red .cr,.card.red .cs{color:var(--red)}.card.black .cr,.card.black .cs{color:var(--dark)}
+.cr{font-family:'Playfair Display',serif;font-weight:700;font-size:clamp(.5rem,1.8vw,.75rem);line-height:1.1;display:flex;flex-direction:column;align-items:flex-start}.cr .sm{font-size:.65em;line-height:1}
+.crb{position:absolute;bottom:3px;right:3px;font-family:'Playfair Display',serif;font-weight:700;font-size:clamp(.5rem,1.8vw,.75rem);line-height:1.1;transform:rotate(180deg);display:flex;flex-direction:column;align-items:flex-start}.crb .sm{font-size:.65em;line-height:1}
+.cs{flex:1;display:flex;align-items:center;justify-content:center;font-size:clamp(.9rem,3.2vw,1.35rem)}
+.game-v{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative}
+.sbar{background:rgba(2,8,4,.97);border-bottom:1px solid var(--bdr);padding:.42rem .8rem;display:flex;align-items:center;justify-content:space-between;gap:.45rem;flex-shrink:0;z-index:20}
+.sside{display:flex;align-items:center;gap:.45rem;flex:1}.sside.r{justify-content:flex-end;flex-direction:row-reverse}
+.slbl{font-size:.6rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.mtrack{display:flex;gap:3px}
+.mpip{width:clamp(22px,6vw,28px);height:clamp(31px,8.5vw,40px);background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.07);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:clamp(.7rem,2.3vw,.95rem);transition:all var(--tm)}
+.mpip.won{background:rgba(212,175,55,.13);border-color:rgba(212,175,55,.48);animation:pipPop var(--ts)}
+@keyframes pipPop{0%{transform:scale(0) rotate(-20deg)}60%{transform:scale(1.25) rotate(5deg)}100%{transform:scale(1) rotate(0)}}
+.mnum{font-family:'Playfair Display',serif;font-size:clamp(1rem,3.8vw,1.35rem);font-weight:900;color:var(--gold);min-width:22px;text-align:center;line-height:1}
+.twrap{display:flex;flex-direction:column;align-items:center;gap:2px;flex-shrink:0}
+.tlbl{font-size:.5rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.tmini{width:28px;height:40px;border-radius:4px;box-shadow:var(--sh1);position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.tmini.hid{background:linear-gradient(135deg,#0e3a1f,#051910);border:1px solid rgba(212,175,55,.28);animation:hidPulse 2.8s ease-in-out infinite}
+.tmini.hid::after{content:'?';font-family:'Playfair Display',serif;font-size:1.05rem;font-weight:900;color:rgba(212,175,55,.55)}
+@keyframes hidPulse{0%,100%{box-shadow:0 0 6px rgba(212,175,55,.18)}50%{box-shadow:0 0 14px rgba(212,175,55,.45)}}
+.tmini.sho{background:#fefefe;border:1px solid #ddd;animation:tRevMini var(--ts)}
+@keyframes tRevMini{0%{transform:scale(0) rotateY(90deg)}100%{transform:scale(1) rotateY(0)}}
+.tface{display:flex;flex-direction:column;align-items:center;font-size:.52rem;font-weight:800;font-family:'Playfair Display',serif;line-height:1.1}.tface .ts{font-size:.88rem}
+.felt{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
+.deco{position:absolute;font-size:5rem;opacity:.032;color:#fff;pointer-events:none;line-height:1}.deco.tl{top:4px;left:8px}.deco.tr{top:4px;right:8px}.deco.bl{bottom:4px;left:8px}.deco.br{bottom:4px;right:8px}
+.seat{position:absolute;display:flex;flex-direction:column;align-items:center;gap:4px;transition:all var(--tm)}.seat.top{top:8px;left:50%;transform:translateX(-50%)}.seat.left{left:6px;top:50%;transform:translateY(-50%)}.seat.right{right:6px;top:50%;transform:translateY(-50%)}
+.sav{width:clamp(40px,10.5vw,52px);height:clamp(40px,10.5vw,52px);border-radius:50%;background:linear-gradient(145deg,var(--g3),var(--g1));border:2px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:clamp(.82rem,2.8vw,1.05rem);color:#fff;box-shadow:var(--sh1);transition:all var(--tm);position:relative}
+.sav.bot{background:linear-gradient(145deg,#2c3e50,#1a252f)}.sav.act{border-color:var(--gold);box-shadow:0 0 22px rgba(212,175,55,.55),var(--sh1);animation:pulseAct 1.8s ease-in-out infinite}
+@keyframes pulseAct{0%,100%{box-shadow:0 0 18px rgba(212,175,55,.45),var(--sh1)}50%{box-shadow:0 0 34px rgba(212,175,55,.85),var(--sh1)}}
+.thdot-wrap{position:absolute;bottom:-3px;right:-3px;width:17px;height:17px;background:var(--gold);border-radius:50%;border:2px solid var(--g0);display:flex;align-items:center;justify-content:center;gap:1.5px}
+.td{width:2px;height:2px;background:#180700;border-radius:50%;animation:tdBnc .9s ease-in-out infinite}.td:nth-child(2){animation-delay:.18s}.td:nth-child(3){animation-delay:.36s}
+@keyframes tdBnc{0%,80%,100%{transform:scaleY(1)}40%{transform:scaleY(1.9)}}
+.snm{font-size:clamp(.58rem,1.9vw,.7rem);font-weight:600;color:var(--muted);white-space:nowrap;max-width:70px;overflow:hidden;text-overflow:ellipsis;text-align:center}
+.sbadge{font-size:.56rem;font-weight:700;padding:1px 6px;border-radius:8px;text-transform:uppercase;letter-spacing:.06em}.sbadge.a{background:rgba(41,128,185,.22);color:#5dade2;border:1px solid rgba(41,128,185,.32)}.sbadge.b{background:rgba(192,57,43,.22);color:#e87;border:1px solid rgba(192,57,43,.32)}
+.opips{display:flex;margin-top:2px}.opip{width:12px;height:18px;background:linear-gradient(135deg,#0e3a1f,#051910);border:1px solid rgba(212,175,55,.15);border-radius:2px;margin-left:-5px;box-shadow:1px 1px 3px rgba(0,0,0,.4)}.opip:first-child{margin-left:0}
+.trickc{position:relative;width:min(205px,47vw);height:min(205px,47vw);display:flex;align-items:center;justify-content:center}
+.tslot{position:absolute;width:min(56px,13vw);height:min(80px,18.5vw)}.tslot.T{top:0;left:50%;transform:translateX(-50%)}.tslot.B{bottom:0;left:50%;transform:translateX(-50%)}.tslot.L{left:0;top:50%;transform:translateY(-50%)}.tslot.R{right:0;top:50%;transform:translateY(-50%)}
+.tsin{width:100%;height:100%;animation:cpIn .36s cubic-bezier(.4,0,.2,1) both}
+@keyframes cpIn{from{transform:scale(1.4) translateY(-16px);opacity:0}to{transform:scale(1) translateY(0);opacity:1}}
+.ppill{font-size:.58rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 9px;border-radius:8px;background:rgba(0,0,0,.44);border:1px solid var(--bdr);color:var(--muted)}
+.tcnt{font-size:.6rem;color:var(--muted);background:rgba(0,0,0,.34);padding:2px 10px;border-radius:8px}
+.finfo{position:absolute;display:flex;flex-direction:column;align-items:center;gap:4px}.finfo.tr{top:8px;right:8px}.finfo.bc{bottom:8px;left:50%;transform:translateX(-50%)}
+.turn-b{position:absolute;left:50%;transform:translateX(-50%);font-size:.72rem;font-weight:600;color:var(--gold);background:rgba(0,0,0,.55);border:1px solid rgba(212,175,55,.28);padding:4px 14px;border-radius:10px;white-space:nowrap;z-index:10;transition:all var(--tm);bottom:calc(clamp(76px,21.5vw,108px) + 10px)}
+.turn-b.d{color:#e87;border-color:rgba(220,80,60,.38)}
+.hstrip{background:rgba(1,7,3,.97);border-top:1px solid var(--bdr);padding:7px 5px 9px;flex-shrink:0;position:relative;z-index:10}
+.hlbl{text-align:center;font-size:.6rem;color:var(--muted);margin-bottom:4px}
+.hinner{display:flex;align-items:flex-end;justify-content:center;gap:3px;overflow:visible;height:clamp(76px,21.5vw,108px);flex-wrap:nowrap}
+.hcw{flex-shrink:0;width:clamp(44px,12vw,62px);height:clamp(62px,17vw,88px);transition:margin var(--tm),transform var(--tm);transform-origin:bottom center;animation:hcIn var(--ts) both}
+@keyframes hcIn{from{transform:scale(.6) translateY(28px) rotate(5deg);opacity:0}to{transform:scale(1) translateY(0) rotate(0);opacity:1}}
+.hcw:hover .card.play{transform:translateY(-13px) scale(1.11);box-shadow:0 22px 55px rgba(0,0,0,.7)}
+#tflash{position:fixed;inset:0;z-index:2000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.9rem;pointer-events:none;opacity:0}
+#tflash.show{animation:tflashFade 3s ease forwards}
+@keyframes tflashFade{0%{opacity:0}8%{opacity:1}75%{opacity:.88}100%{opacity:0}}
+.fsym{font-size:clamp(5.5rem,27vw,11rem);line-height:1;animation:symStamp 3s cubic-bezier(.34,1.56,.64,1) forwards;opacity:0}
+@keyframes symStamp{0%{transform:scale(5) rotate(-22deg);opacity:0;filter:blur(12px)}14%{transform:scale(.87) rotate(4deg);opacity:1;filter:blur(0)}35%{transform:scale(1) rotate(0);opacity:1}80%{transform:scale(1.06);opacity:.9}100%{transform:scale(1.6);opacity:0}}
+.ftxt{font-family:'Playfair Display',serif;font-size:clamp(1.3rem,5.5vw,2.4rem);color:#fff;text-shadow:0 2px 18px rgba(0,0,0,.6);animation:ftIn 3s ease forwards;opacity:0}
+.fsub{font-size:.85rem;color:rgba(255,255,255,.65);animation:ftIn 3s ease .1s forwards;opacity:0}
+@keyframes ftIn{0%{opacity:0;transform:translateY(22px)}14%{opacity:1;transform:translateY(0)}80%{opacity:1}100%{opacity:0}}
+.boot-ov{position:fixed;inset:0;z-index:1500;background:rgba(3,11,5,.88);backdrop-filter:blur(4px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.1rem;animation:ovFIn .3s ease}
+@keyframes ovFIn{from{opacity:0}to{opacity:1}}
+.boot-t{font-family:'Playfair Display',serif;font-size:1.45rem;color:var(--gold)}.boot-cards{display:flex;gap:4px;align-items:flex-end}
+.bca{width:22px;height:32px;background:linear-gradient(135deg,#0e3a1f,#051910);border:1px solid rgba(212,175,55,.22);border-radius:3px;animation:bcPop var(--ts) both}
+@keyframes bcPop{from{transform:translateY(-45px) scale(.5);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+.tsel{position:fixed;inset:0;z-index:1800;background:rgba(3,11,5,.92);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:1.5rem;gap:.9rem;animation:ovFIn .2s ease}
+.tsel-t{font-family:'Playfair Display',serif;font-size:1.2rem;color:var(--gold)}.tsel-s{font-size:.78rem;color:var(--muted);text-align:center;max-width:270px}
+.tsel-grid{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;max-width:370px}
+.tsel-c{width:clamp(46px,12.5vw,58px);height:clamp(64px,17.5vw,82px);cursor:pointer;transition:transform var(--tm)}.tsel-c:hover{transform:translateY(-10px) scale(1.1)}
+.res-v{position:fixed;inset:0;z-index:1200;background:rgba(3,11,5,.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.4rem;padding:2rem;animation:ovFIn .5s ease}
+.rtrophy{font-size:5rem;animation:trPop var(--ts) .3s both}
+@keyframes trPop{from{transform:scale(0) rotate(-25deg);opacity:0}to{transform:scale(1) rotate(0);opacity:1}}
+.rtitle{font-family:'Playfair Display',serif;font-size:clamp(1.9rem,9vw,3.4rem);font-weight:900;background:linear-gradient(135deg,var(--gold2),var(--gold));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;text-align:center}
+.rscores{display:flex;align-items:center;gap:1.8rem}.rteam{display:flex;flex-direction:column;align-items:center;gap:.45rem}
+.rteam-l{font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}.rmrow{display:flex;gap:4px}
+.rmc{width:28px;height:40px;background:#fff;border-radius:4px;box-shadow:var(--sh1);display:flex;align-items:center;justify-content:center;font-size:.95rem}.rnum{font-family:'Playfair Display',serif;font-size:2.4rem;font-weight:900;color:var(--gold);line-height:1}.rvs{font-size:1.1rem;color:var(--muted)}.rbtns{display:flex;gap:.7rem;flex-wrap:wrap;justify-content:center}
+#toasts{position:fixed;top:68px;left:50%;transform:translateX(-50%);z-index:3000;display:flex;flex-direction:column;align-items:center;gap:6px;pointer-events:none}
+.toast{background:rgba(6,20,10,.96);border:1px solid var(--bdr);border-radius:10px;padding:6px 17px;font-size:.8rem;font-weight:600;color:var(--txt);backdrop-filter:blur(12px);box-shadow:var(--sh2);white-space:nowrap;animation:tIn .3s var(--ts),tOut .3s ease 2.6s forwards}
+@keyframes tIn{from{transform:translateY(-15px) scale(.9);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes tOut{to{transform:translateY(-15px);opacity:0}}
+.conf{position:fixed;z-index:1100;top:-20px;width:8px;height:8px;border-radius:2px;animation:cFall linear forwards;pointer-events:none}
+@keyframes cFall{to{transform:translateY(115vh) rotate(800deg);opacity:0}}
+.ws-badge{position:fixed;bottom:8px;right:8px;font-size:.6rem;padding:3px 8px;border-radius:6px;z-index:100;font-weight:700;letter-spacing:.08em}
+.ws-badge.ok{background:rgba(39,174,96,.2);color:#5eead4;border:1px solid rgba(39,174,96,.3)}
+.ws-badge.err{background:rgba(192,57,43,.2);color:#f87171;border:1px solid rgba(192,57,43,.3)}
+@media(max-width:380px){.trickc{width:180px;height:180px}.tslot{width:50px;height:71px}}
+@media(min-width:600px){.trickc{width:245px;height:245px}.tslot{width:65px;height:92px}}
+@media(min-width:900px){.trickc{width:285px;height:285px}.tslot{width:75px;height:107px}.hcw{width:70px;height:100px}}
+@media(min-width:1100px){.game-v,.menu-v,.hub-v,.form-v{max-width:510px;margin:0 auto;border-left:1px solid var(--bdr);border-right:1px solid var(--bdr)}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
-<div id="app">
+<div id="app"></div>
+<div id="tflash"><div class="fsym" id="fsym"></div><div class="ftxt" id="ftxt"></div><div class="fsub" id="fsub"></div></div>
+<div id="toasts"></div>
+<div class="ws-badge err" id="wsbadge">Connecting...</div><script>
+'use strict';
+const SUITS=['S','H','D','C'];
+const SYM={S:'\u2660',H:'\u2665',D:'\u2666',C:'\u2663'};
+const SNAME={S:'Spades',H:'Hearts',D:'Diamonds',C:'Clubs'};
+const RD=new Set(['H','D']);
+const RDSP={11:'J',12:'Q',13:'K',14:'A'};
+const FBGS={H:'rgba(155,28,18,.9)',D:'rgba(160,38,22,.9)',S:'rgba(12,12,46,.92)',C:'rgba(8,46,18,.92)'};
+function rd(r){return RDSP[r]||String(r)}
+function ck(c){return c.r+''+c.s}
+function isRed(c){return RD.has(c.s)}
+function isMn(c){return c.r===10}
+function h(str){return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-  <!-- ============ LANDING MENU ============ -->
-  <div id="view-menu" class="home-wrap">
-    <h1 class="home-title">Mendikot<span class="stamp-suits">♠ ♥ ♦ ♣</span></h1>
-    <div class="menu-buttons">
-      <button class="btn-solo" id="btn-solo">Solo<span class="btn-solo-sub">Play instantly vs 3 bots</span></button>
-      <button class="btn-friends" id="btn-goto-hub">Play with Friends<span class="btn-friends-sub">Create or join a room</span></button>
-    </div>
-  </div>
+const ST={view:'menu',name:localStorage.getItem('mdk_n')||'',gs:null};
+let WS=null;
 
-  <!-- ============ FRIENDS HUB (Create Room / Join Room) ============ -->
-  <div id="view-hub" class="home-wrap hidden">
-    <button class="back-link" id="btn-hub-back">&larr; Back</button>
-    <h2 class="screen-title">Play with Friends</h2>
-    <div class="menu-buttons">
-      <button class="btn-primary" id="btn-goto-create">Create Room</button>
-      <button class="btn-secondary" id="btn-goto-join">Join Room</button>
-    </div>
-  </div>
+function initWS(){
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  WS=new WebSocket(proto+'//'+location.host+'/ws');
+  WS.onopen=function(){setBadge(true);};
+  WS.onclose=function(){WS=null;setBadge(false);setTimeout(initWS,3000);};
+  WS.onerror=function(){setBadge(false);};
+  WS.onmessage=function(ev){handleMsg(JSON.parse(ev.data));};
+}
 
-  <!-- ============ CREATE ROOM SCREEN ============ -->
-  <div id="view-create" class="home-wrap hidden">
-    <button class="back-link" id="btn-create-back">&larr; Back</button>
-    <h2 class="screen-title">Create Room</h2>
-    <div class="home-card">
-      <div class="error-banner" id="create-error"></div>
-      <label class="field-label">Your name</label>
-      <input type="text" id="create-player-name" placeholder="Enter your name" maxlength="20">
-      <label class="field-label">Choose your team</label>
-      <div class="team-picker" id="create-team-picker">
-        <button class="team-btn team-a" data-team="A">Team A</button>
-        <button class="team-btn team-b" data-team="B">Team B</button>
-      </div>
-      <button class="btn-primary" id="btn-create-confirm">Create Room</button>
-    </div>
-  </div>
+function setBadge(ok){
+  var b=document.getElementById('wsbadge');
+  if(!b)return;
+  b.className='ws-badge '+(ok?'ok':'err');
+  b.textContent=ok?'Connected':'Reconnecting...';
+}
 
-  <!-- ============ JOIN ROOM SCREEN ============ -->
-  <div id="view-join" class="home-wrap hidden">
-    <button class="back-link" id="btn-join-back">&larr; Back</button>
-    <h2 class="screen-title">Join Room</h2>
-    <div class="home-card">
-      <div class="error-banner" id="join-error"></div>
-      <label class="field-label">Your name</label>
-      <input type="text" id="join-player-name" placeholder="Enter your name" maxlength="20">
-      <label class="field-label">Room code</label>
-      <input type="text" id="join-code" placeholder="ABCDE" maxlength="5">
-      <label class="field-label">Choose your team</label>
-      <div class="team-picker" id="join-team-picker">
-        <button class="team-btn team-a" data-team="A">Team A</button>
-        <button class="team-btn team-b" data-team="B">Team B</button>
-      </div>
-      <button class="btn-secondary" id="btn-join-confirm">Join Room</button>
-    </div>
-  </div>
+function wsSend(data){if(WS&&WS.readyState===1)WS.send(JSON.stringify(data));}
 
-  <!-- ============ ROOM / LOBBY VIEW ============ -->
-  <div id="view-room" class="room-wrap hidden">
-    <div class="room-code-display">
-      <div class="label">Room Code</div>
-      <div class="code" id="room-code-text">-----</div>
-      <div class="copy-hint" id="copy-hint">Tap to copy</div>
-    </div>
-
-    <div class="seats-grid" id="seats-grid"></div>
-
-    <div class="waiting-note" id="waiting-note">Waiting for players to join…</div>
-
-    <button class="btn-primary hidden" id="btn-start" style="max-width:280px;">Start Game</button>
-    <button class="exit-link" id="btn-exit-room">Exit Room</button>
-  </div>
-
-  <!-- ============ GAME TABLE VIEW ============ -->
-
-  <div id="view-game" class="table-wrap hidden">
-    <button class="exit-icon-btn" id="btn-exit-game" title="Exit game">&times;</button>
-    <div class="game-vertical-layout">
-
-      <!-- score cluster: fixed at the very top -->
-      <div class="score-cluster">
-        <div class="score-side mine">
-          <div class="score-side-label">Your</div>
-          <div class="score-side-body">
-            <div class="earn-count" id="my-earn-count">0</div>
-            <div class="ten-slots" id="my-ten-slots"></div>
-          </div>
-        </div>
-        <div class="trump-card-box" id="trump-symbol">?</div>
-        <div class="score-side theirs">
-          <div class="score-side-label">Opponent</div>
-          <div class="score-side-body">
-            <div class="ten-slots" id="opp-ten-slots"></div>
-            <div class="earn-count" id="opp-earn-count">0</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- table felt: middle -->
-      <div class="table-felt">
-        <div class="seat-marker top" id="marker-top"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-        <div class="seat-marker left" id="marker-left"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-        <div class="seat-marker right" id="marker-right"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-        <div class="seat-marker bottom-marker" id="marker-bottom"><div class="turn-dot"></div><div class="seat-mini-name">-</div></div>
-        <div class="trick-center" id="trick-center"></div>
-      </div>
-
-      <!-- hand strip: bottom, fixed, never scrolls -->
-      <div class="hand-strip-wrap">
-        <div class="action-bar" id="action-bar"></div>
-        <div class="hand-strip" id="hand-strip"></div>
-      </div>
-    </div>
-  </div>
-
-</div>
-
-<div class="trump-flash" id="trump-flash">
-  <div class="stamp" id="trump-flash-symbol">?</div>
-</div>
-
-<div class="result-overlay" id="result-overlay">
-  <div class="result-card">
-    <h2 class="result-headline" id="result-headline">You Win!</h2>
-    <div class="result-sub" id="result-sub">4 – 0 Mendi</div>
-    <div class="result-mendi-row" id="result-mendi-row"></div>
-    <button class="btn-primary" id="btn-rematch">Rematch</button>
-    <div style="height:10px"></div>
-    <button class="btn-secondary" id="btn-leave">Leave Room</button>
-  </div>
-</div>
-
-<div class="confirm-overlay" id="confirm-overlay">
-  <div class="confirm-card">
-    <div class="confirm-text">Leave game? This will end it for everyone.</div>
-    <div class="confirm-buttons">
-      <button class="btn-secondary" id="btn-confirm-exit-cancel">Cancel</button>
-      <button class="btn-danger" id="btn-confirm-exit-yes">Leave</button>
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-(function() {
-  "use strict";
-
-  // ---------------- state ----------------
-  const S = {
-    ws: null,
-    playerId: null,
-    roomCode: null,
-    mySeat: null,
-    seats: {},          // seat -> {name, connected, team, is_bot}
-    teamFull: { A: false, B: false },
-    hostSeat: 0,
-    gameState: null,    // latest game_state.state
-    pendingReveal: false,
-    selectedRevealCard: null,
-    view: 'menu',
-    createTeam: null,
-    joinTeam: null,
-    isSolo: false,
-    // Cards currently shown on the table, built up live from card_played
-    // events. This is NOT the same as gameState.current_trick: the server
-    // resolves a trick (clearing current_trick) the instant the 4th card is
-    // played, then pauses ~3s before sending the next game_state. If we only
-    // rendered from gameState.current_trick, the 4th card would never
-    // visibly appear - it'd already be gone by the time state arrives. So
-    // displayedTrick is pushed to directly on every card_played, and only
-    // cleared once the next game_state confirms a fresh trick has begun.
-    displayedTrick: [],
-    // Set of "seat:card" keys already rendered as trick-slot elements this
-    // trick, so re-renders (e.g. from a hand_strip-only update) don't replay
-    // the pop-in animation on cards that are already on the table.
-    renderedTrickKeys: new Set(),
-    // Last hand signature we rendered the hand-strip for. Hand cards are
-    // only rebuilt from scratch when the actual set of cards in hand
-    // changes - never on every state update - so there is no re-animation
-    // or flicker on the player's own hand while nothing there changed.
-    lastHandSignature: null,
-    // Tracks previous mendi counts so we know when to bump the earn-count
-    // and which direction to run the collection animation.
-    lastMineCount: 0,
-    lastTheirsCount: 0,
-    collecting: false,
-  };
-
-  const SUIT_SYMBOL = { S: '\u2660', H: '\u2665', D: '\u2666', C: '\u2663' };
-  const RED_SUITS = new Set(['H', 'D']);
-  const SUITS_ORDER = ['S', 'H', 'D', 'C'];
-
-  // ---------------- persistence ----------------
-  function saveSession(playerId, roomCode) {
-    try {
-      sessionStorage.setItem('mendikot_player_id', playerId);
-      sessionStorage.setItem('mendikot_room_code', roomCode);
-    } catch (e) {}
-  }
-  function loadSession() {
-    try {
-      return {
-        playerId: sessionStorage.getItem('mendikot_player_id'),
-        roomCode: sessionStorage.getItem('mendikot_room_code'),
-      };
-    } catch (e) { return {playerId: null, roomCode: null}; }
-  }
-  function clearSession() {
-    try {
-      sessionStorage.removeItem('mendikot_player_id');
-      sessionStorage.removeItem('mendikot_room_code');
-    } catch (e) {}
-  }
-  function uuid() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
+function handleMsg(msg){
+  if(msg.type==='state'){
+    ST.gs=msg.state;
+    var evts=msg.events||[];
+    if(evts.indexOf('trump_revealed')>=0&&ST.gs.trump){showTFlash(ST.gs.trump.s,ST.gs.trump.by_name);}
+    if(evts.indexOf('boot_dealt')>=0){bootAnim();}
+    evts.forEach(function(e){
+      if(e.indexOf('mendi:')==0){var p=e.split(':');toast(p[1]+' captured '+p[2]+' mendi! \u2736');}
     });
+    if(evts.indexOf('game_started')>=0){toast('Game started! '+ST.gs.players[ST.gs.whose].name+' leads.');}
+    if(ST.gs.done){ST.view='result';render();if(ST.gs.team_mn[0]!==ST.gs.team_mn[1])confetti();return;}
+    if(ST.gs.players){ST.view='game';}
+    render();
   }
-  const RANDOM_NAME_POOL = ['Ravi','Meera','Sanjay','Priya','Arjun','Divya','Karan','Anita','Vikram','Neha','Rohan','Kavya','Aman','Sunita','Deepak','Pooja'];
-  function randomPlayerName() {
-    const n = RANDOM_NAME_POOL[Math.floor(Math.random() * RANDOM_NAME_POOL.length)];
-    return n + (10 + Math.floor(Math.random() * 90));
-  }
-
-  // ---------------- view switching ----------------
-  const ALL_VIEWS = ['menu', 'hub', 'create', 'join', 'room', 'game'];
-  function showView(name) {
-    S.view = name;
-    ALL_VIEWS.forEach(v => {
-      document.getElementById('view-' + v).classList.toggle('hidden', v !== name);
-    });
-    document.body.classList.toggle('in-game', name === 'game');
-  }
-
-  function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.classList.add('show');
-    clearTimeout(t._hideTimer);
-    t._hideTimer = setTimeout(() => t.classList.remove('show'), 2600);
-  }
-
-  function showError(bannerId, msg) {
-    const el = document.getElementById(bannerId);
-    el.textContent = msg;
-    el.classList.add('show');
-  }
-  function clearError(bannerId) {
-    document.getElementById(bannerId).classList.remove('show');
-  }
-
-  // ---------------- websocket ----------------
-  function connect() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    S.ws = new WebSocket(proto + '//' + location.host + '/ws');
-    S.ws.onopen = () => { tryAutoRejoin(); };
-    S.ws.onmessage = (ev) => handleMessage(JSON.parse(ev.data));
-    S.ws.onclose = () => {
-      showToast('Connection lost. Reconnecting…');
-      setTimeout(connect, 1500);
-    };
-    S.ws.onerror = () => {};
-  }
-
-  function send(payload) {
-    if (S.ws && S.ws.readyState === WebSocket.OPEN) {
-      S.ws.send(JSON.stringify(payload));
-    }
-  }
-
-  function tryAutoRejoin() {
-    const sess = loadSession();
-    if (sess.playerId && sess.roomCode) {
-      send({ type: 'join_room', room_code: sess.roomCode, player_name: localStorage.getItem('mendikot_name') || 'Player', player_id: sess.playerId });
-    }
-  }
-
-  function handleMessage(msg) {
-    switch (msg.type) {
-      case 'joined':
-        S.playerId = msg.player_id;
-        S.roomCode = msg.room_code;
-        S.mySeat = msg.your_seat;
-        S.isSolo = !!msg.solo;
-        saveSession(S.playerId, S.roomCode);
-        document.getElementById('room-code-text').textContent = S.roomCode;
-        if (S.isSolo) {
-          // Solo games skip the lobby entirely - straight to the table.
-          break;
-        }
-        if (S.view === 'create' || S.view === 'join' || S.view === 'menu' || S.view === 'hub') showView('room');
-        break;
-
-      case 'room_update':
-        S.seats = msg.seats;
-        S.teamFull = msg.team_full || { A: false, B: false };
-        S.hostSeat = msg.host_seat;
-        if (!S.isSolo) renderLobby(msg);
-        if (msg.game_in_progress && S.view !== 'game') {
-          showView('game');
-        }
-        break;
-
-      case 'game_state':
-        S.gameState = msg.state;
-        // Sync the displayed trick from server state. During normal mid-trick
-        // updates (1-3 cards in) this just mirrors current_trick. When this
-        // arrives AFTER the pause (current_trick now empty because the
-        // server already resolved it), this is what actually clears the
-        // table for the next trick.
-        S.displayedTrick = (msg.state.current_trick || []).slice();
-        S.renderedTrickKeys = new Set(S.displayedTrick.map(p => p.seat + ':' + p.card));
-        if (S.view !== 'game') showView('game');
-        renderGame();
-        break;
-
-      case 'hand_started':
-        S.pendingReveal = false;
-        S.selectedRevealCard = null;
-        S.displayedTrick = [];
-        S.renderedTrickKeys = new Set();
-        S.lastHandSignature = null;
-        S.lastMineCount = 0;
-        S.lastTheirsCount = 0;
-        hideResultOverlay();
-        break;
-
-      case 'card_played':
-        // Push immediately so the card appears on the table in real time,
-        // even for the trick-completing 4th card (whose play already
-        // resolved the trick server-side, clearing current_trick before the
-        // next game_state - which won't arrive until after the pause).
-        if (!S.displayedTrick.some(p => p.seat === msg.seat)) {
-          S.displayedTrick.push({ seat: msg.seat, card: msg.card });
-        }
-        renderGame();
-        break;
-
-      case 'must_reveal_trump':
-        S.pendingReveal = true;
-        renderGame();
-        break;
-
-      case 'trump_revealed':
-        S.pendingReveal = false;
-        // The reveal itself plays a card into the trick too (see reveal_trump
-        // server-side) - show it immediately just like card_played does.
-        if (!S.displayedTrick.some(p => p.seat === msg.seat)) {
-          S.displayedTrick.push({ seat: msg.seat, card: msg.card });
-        }
-        flashTrumpReveal(msg.trump_suit);
-        renderGame();
-        break;
-
-      case 'trick_won':
-        animateTrickCollection(msg.winner_seat);
-        break;
-
-      case 'hand_complete':
-        showResultOverlay(msg.winner_team, msg.final_mendi);
-        break;
-
-      case 'room_cancelled':
-        handleRoomCancelled(msg);
-        break;
-
-      case 'error':
-        const friendly = friendlyErrorMessage(msg.message);
-        showToast(friendly);
-        if (S.view === 'create') showError('create-error', friendly);
-        else if (S.view === 'join') showError('join-error', friendly);
-        break;
-    }
-  }
-
-  function friendlyErrorMessage(code) {
-    const map = {
-      'ROOM_NOT_FOUND': 'Room not found. Check the code and try again.',
-      'ROOM_FULL': 'That room is already full.',
-      'TEAM_FULL': 'That team is already full \u2014 try the other team.',
-    };
-    return map[code] || code;
-  }
-
-  function handleRoomCancelled(msg) {
-    clearSession();
-    const reasonText = msg.reason === 'host_left'
-      ? 'The host left, so the room was closed.'
-      : 'A player left the game, so the room was closed.';
-    showToast(reasonText);
-    setTimeout(() => { location.reload(); }, 1800);
-  }
-
-  // ---------------- menu / navigation actions ----------------
-  document.getElementById('btn-solo').addEventListener('click', () => {
-    const name = localStorage.getItem('mendikot_name') || randomPlayerName();
-    send({ type: 'create_solo', player_name: name });
-  });
-  document.getElementById('btn-goto-hub').addEventListener('click', () => {
-    showView('hub');
-  });
-  document.getElementById('btn-hub-back').addEventListener('click', () => {
-    showView('menu');
-  });
-  document.getElementById('btn-goto-create').addEventListener('click', () => {
-    showView('create');
-  });
-  document.getElementById('btn-goto-join').addEventListener('click', () => {
-    showView('join');
-  });
-  document.getElementById('btn-create-back').addEventListener('click', () => {
-    showView('hub');
-  });
-  document.getElementById('btn-join-back').addEventListener('click', () => {
-    showView('hub');
-  });
-
-  // ---------------- team picker (shared logic for create + join screens) ----------------
-  function setupTeamPicker(pickerId, stateKey) {
-    const picker = document.getElementById(pickerId);
-    picker.querySelectorAll('.team-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        if (btn.classList.contains('full')) return;
-        S[stateKey] = btn.dataset.team;
-        picker.querySelectorAll('.team-btn').forEach(b => b.classList.toggle('selected', b === btn));
-      });
-    });
-  }
-  setupTeamPicker('create-team-picker', 'createTeam');
-  setupTeamPicker('join-team-picker', 'joinTeam');
-
-  // ---------------- create room ----------------
-  document.getElementById('btn-create-confirm').addEventListener('click', () => {
-    clearError('create-error');
-    const name = document.getElementById('create-player-name').value.trim() || 'Host';
-    if (!S.createTeam) { showError('create-error', 'Choose a team'); return; }
-    localStorage.setItem('mendikot_name', name);
-    send({ type: 'create_room', player_name: name, team: S.createTeam });
-  });
-
-  // ---------------- join room ----------------
-  document.getElementById('btn-join-confirm').addEventListener('click', () => {
-    clearError('join-error');
-    const name = document.getElementById('join-player-name').value.trim() || 'Player';
-    const code = document.getElementById('join-code').value.trim().toUpperCase();
-    if (!code) { showError('join-error', 'Enter a room code'); return; }
-    if (!S.joinTeam) { showError('join-error', 'Choose a team'); return; }
-    localStorage.setItem('mendikot_name', name);
-    send({ type: 'join_room', room_code: code, player_name: name, player_id: uuid(), team: S.joinTeam });
-  });
-
-  document.getElementById('join-code').addEventListener('input', (e) => {
-    e.target.value = e.target.value.toUpperCase();
-  });
-
-  document.getElementById('copy-hint').addEventListener('click', () => {
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(S.roomCode).then(() => showToast('Room code copied'));
-    }
-  });
-
-  document.getElementById('btn-start').addEventListener('click', () => {
-    send({ type: 'start_game' });
-  });
-
-  document.getElementById('btn-rematch').addEventListener('click', () => {
-    send({ type: 'rematch' });
-  });
-
-  document.getElementById('btn-leave').addEventListener('click', () => {
-    clearSession();
-    location.reload();
-  });
-
-  // ---------------- exit game/room ----------------
-  function showConfirmExit() {
-    document.getElementById('confirm-overlay').classList.add('show');
-  }
-  function hideConfirmExit() {
-    document.getElementById('confirm-overlay').classList.remove('show');
-  }
-  document.getElementById('btn-exit-room').addEventListener('click', () => {
-    // Non-host leaving an idle lobby doesn't end anything for others, so
-    // skip the "this will end it for everyone" confirmation in that case.
-    if (S.mySeat !== 0 && S.view === 'room') {
-      send({ type: 'exit_game' });
-      clearSession();
-      location.reload();
-    } else {
-      showConfirmExit();
-    }
-  });
-  document.getElementById('btn-exit-game').addEventListener('click', showConfirmExit);
-  document.getElementById('btn-confirm-exit-cancel').addEventListener('click', hideConfirmExit);
-  document.getElementById('btn-confirm-exit-yes').addEventListener('click', () => {
-    send({ type: 'exit_game' });
-    hideConfirmExit();
-    clearSession();
-    location.reload();
-  });
-
-  // ---------------- lobby render ----------------
-  function renderLobby(msg) {
-    const grid = document.getElementById('seats-grid');
-    grid.innerHTML = '';
-    for (let s = 0; s < 4; s++) {
-      const seatData = msg.seats[String(s)];
-      const div = document.createElement('div');
-      const team = s % 2 === 0 ? 'team-a' : 'team-b';
-      div.className = 'seat-slot ' + team + (seatData ? '' : ' empty');
-      if (seatData) {
-        div.innerHTML =
-          '<div class="seat-name">' + escapeHtml(seatData.name) + '</div>' +
-          '<div class="seat-team">Team ' + (s % 2 === 0 ? 'A' : 'B') + '</div>' +
-          (s === S.mySeat ? '<div class="you-badge">YOU</div>' : '') +
-          (!seatData.connected ? '<div class="disconnected-badge"></div>' : '');
-      } else {
-        div.innerHTML = '<div class="seat-name">Open Seat</div><div class="seat-team">Team ' + (s % 2 === 0 ? 'A' : 'B') + '</div>';
-      }
-      grid.appendChild(div);
-    }
-
-    const startBtn = document.getElementById('btn-start');
-    const note = document.getElementById('waiting-note');
-    if (S.mySeat === 0) {
-      startBtn.classList.toggle('hidden', !msg.is_full);
-      note.classList.toggle('hidden', msg.is_full);
-    } else {
-      startBtn.classList.add('hidden');
-      note.textContent = msg.is_full ? 'Waiting for host to start…' : 'Waiting for players to join…';
-    }
-  }
-
-  function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
-
-  // ---------------- card rendering helpers ----------------
-  function cardColor(card) {
-    const suit = card.slice(-1);
-    return RED_SUITS.has(suit) ? 'red' : 'black';
-  }
-  function cardRank(card) { return card.slice(0, -1); }
-  function cardSuit(card) { return card.slice(-1); }
-
-  function makeCardEl(card, cls, trumpSuit) {
-    const el = document.createElement('div');
-    const color = cardColor(card);
-    el.className = cls + ' ' + color;
-    if (trumpSuit && cardSuit(card) === trumpSuit) el.classList.add('trump-marked');
-    const rank = cardRank(card);
-    const suitSym = SUIT_SYMBOL[cardSuit(card)];
-    el.innerHTML =
-      '<div class="' + (cls === 'pcard' ? 'pcard-rank' : 'hc-rank') + '">' + rank + suitSym + '</div>' +
-      '<div class="' + (cls === 'pcard' ? 'pcard-suit-big' : 'hc-suit-big') + '">' + suitSym + '</div>' +
-      '<div class="' + (cls === 'pcard' ? 'pcard-rank bottom' : 'hc-rank bottom') + '">' + rank + suitSym + '</div>';
-    return el;
-  }
-
-  // ---------------- game render ----------------
-  function renderGame() {
-    const st = S.gameState;
-    if (!st) return;
-
-    const mySeat = st.your_seat;
-    const myTeam = mySeat % 2 === 0 ? 'A' : 'B';
-
-    // aggregate which ten-suits each team has won, and total card count
-    const mineSuits = [];
-    const theirsSuits = [];
-    for (const seatStr in st.mendi_suits_won) {
-      const seat = parseInt(seatStr, 10);
-      const team = seat % 2 === 0 ? 'A' : 'B';
-      const suits = st.mendi_suits_won[seatStr] || [];
-      if (team === myTeam) mineSuits.push(...suits);
-      else theirsSuits.push(...suits);
-    }
-    renderTenSlots('my-ten-slots', mineSuits, 'mine');
-    renderTenSlots('opp-ten-slots', theirsSuits, 'theirs');
-
-    // earn-count: total mendi (10s) cards earned by each side so far, not
-    // rounds/tricks won - a single trick can add up to 4 at once.
-    updateEarnCount('my-earn-count', mineSuits.length, 'lastMineCount');
-    updateEarnCount('opp-earn-count', theirsSuits.length, 'lastTheirsCount');
-
-    // trump card: "?" before reveal, suit symbol only after reveal
-    const trumpBox = document.getElementById('trump-symbol');
-    if (st.trump_suit) {
-      trumpBox.className = 'trump-card-box revealed ' + (RED_SUITS.has(st.trump_suit) ? 'red' : 'black');
-      trumpBox.textContent = SUIT_SYMBOL[st.trump_suit];
-    } else {
-      trumpBox.className = 'trump-card-box';
-      trumpBox.textContent = '?';
-    }
-
-    // seat markers (relative to me: bottom = me, then left/top/right going clockwise from my left)
-    const order = [mySeat, (mySeat + 1) % 4, (mySeat + 2) % 4, (mySeat + 3) % 4];
-    const posMap = { bottom: order[0], left: order[1], top: order[2], right: order[3] };
-    for (const pos in posMap) {
-      const seat = posMap[pos];
-      const seatInfo = S.seats[String(seat)] || { name: 'P' + seat, connected: true };
-      const el = document.getElementById('marker-' + pos);
-      el.classList.toggle('active', st.turn_seat === seat && st.phase !== 'HAND_COMPLETE');
-      el.classList.toggle('disconnected', seatInfo.connected === false);
-      const nameEl = el.querySelector('.seat-mini-name');
-      nameEl.textContent = seat === mySeat ? 'You' : seatInfo.name;
-    }
-
-    // trick center - render from S.displayedTrick, only adding pop-in
-    // animation to newly-arrived cards (tracked via renderedTrickKeys) so
-    // an unrelated re-render (e.g. hand strip refresh) never replays it.
-    renderTrickCenter(order);
-
-    // action bar (reveal button only - no prompt text, no toast after reveal)
-    const actionBar = document.getElementById('action-bar');
-    actionBar.innerHTML = '';
-    if (S.pendingReveal && st.turn_seat === mySeat) {
-      const hand = st.your_hand || [];
-      if (!S.selectedRevealCard || !hand.includes(S.selectedRevealCard)) {
-        // default to lowest card so a reveal button is always ready to tap
-        S.selectedRevealCard = null;
-      }
-      if (S.selectedRevealCard) {
-        const btn = document.createElement('button');
-        btn.className = 'reveal-btn';
-        btn.textContent = 'Reveal ' + cardRank(S.selectedRevealCard) + SUIT_SYMBOL[cardSuit(S.selectedRevealCard)];
-        btn.onclick = () => {
-          send({ type: 'reveal_trump', card: S.selectedRevealCard });
-          S.selectedRevealCard = null;
-        };
-        actionBar.appendChild(btn);
-      }
-    }
-
-    renderHandStrip(st);
-  }
-
-  function updateEarnCount(elId, newCount, trackKey) {
-    const el = document.getElementById(elId);
-    const prev = S[trackKey];
-    el.textContent = String(newCount);
-    if (newCount !== prev) {
-      el.classList.remove('bump');
-      // force reflow so the animation can re-trigger
-      void el.offsetWidth;
-      el.classList.add('bump');
-    }
-    S[trackKey] = newCount;
-  }
-
-  function renderTrickCenter(order) {
-    const center = document.getElementById('trick-center');
-    const posOf = {};
-    posOf[order[0]] = 'pos-bottom';
-    posOf[order[1]] = 'pos-left';
-    posOf[order[2]] = 'pos-top';
-    posOf[order[3]] = 'pos-right';
-
-    const wantedKeys = new Set((S.displayedTrick || []).map(p => p.seat + ':' + p.card));
-
-    // remove slots for cards no longer displayed (new trick started)
-    Array.from(center.children).forEach(child => {
-      if (!wantedKeys.has(child.dataset.key)) center.removeChild(child);
-    });
-
-    (S.displayedTrick || []).forEach(play => {
-      const key = play.seat + ':' + play.card;
-      if (center.querySelector('[data-key="' + key + '"]')) return; // already rendered, skip re-animation
-      const slot = document.createElement('div');
-      slot.className = 'trick-slot ' + posOf[play.seat];
-      slot.dataset.key = key;
-      const cardEl = makeCardEl(play.card, 'pcard', S.gameState.trump_suit);
-      slot.appendChild(cardEl);
-      center.appendChild(slot);
-    });
-  }
-
-  function animateTrickCollection(winnerSeat) {
-    const st = S.gameState;
-    if (!st) return;
-    const mySeat = st.your_seat;
-    const myTeam = mySeat % 2 === 0 ? 'A' : 'B';
-    const winnerTeam = winnerSeat % 2 === 0 ? 'A' : 'B';
-    const dir = winnerTeam === myTeam ? 'collect-mine' : 'collect-theirs';
-    const center = document.getElementById('trick-center');
-    Array.from(center.children).forEach(child => {
-      child.classList.add(dir);
-    });
-  }
-
-  function renderTenSlots(containerId, wonSuits, kind) {
-    const el = document.getElementById(containerId);
-    el.innerHTML = '';
-    const wonSet = new Set(wonSuits);
-    SUITS_ORDER.forEach(suit => {
-      const slot = document.createElement('div');
-      const isWon = wonSet.has(suit);
-      const color = RED_SUITS.has(suit) ? 'red' : 'black';
-      slot.className = 'ten-slot' + (isWon ? ' won ' + color + ' ' + kind : '');
-      slot.innerHTML = '<div class="ts-suit">' + SUIT_SYMBOL[suit] + '</div>';
-      el.appendChild(slot);
-    });
-  }
-
-  function computeLegalMoves(st, hand) {
-    if (!st.current_trick || st.current_trick.length === 0) {
-      return new Set(hand);
-    }
-    if (st.trick_void_exempt_seats && st.trick_void_exempt_seats.includes(st.your_seat)) {
-      return new Set(hand);
-    }
-    const led = st.led_suit;
-    const sameSuit = hand.filter(c => cardSuit(c) === led);
-    if (sameSuit.length > 0) return new Set(sameSuit);
-    return new Set(hand);
-  }
-
-  // ---------------- hand strip: fixed, non-scrolling, fits every card ----------------
-  // Cards overlap (negative margin via flex gap) so any hand size from 5 to
-  // 13 always fits the strip width without ever scrolling. Card width/height
-  // and overlap amount are computed from available width and hand size.
-  function renderHandStrip(st) {
-    const handStrip = document.getElementById('hand-strip');
-    const hand = st.your_hand || [];
-    const myTurn = st.turn_seat === st.your_seat && st.phase !== 'HAND_COMPLETE';
-    const legalSet = computeLegalMoves(st, hand);
-
-    const signature = hand.join(',') + '|' + myTurn + '|' + Array.from(legalSet).join(',') +
-      '|' + (S.pendingReveal ? '1' : '0') + '|' + (S.selectedRevealCard || '');
-
-    sizeHandCards(handStrip, hand.length);
-
-    if (S.lastHandSignature === signature) {
-      return; // nothing actually changed about the hand - skip rebuild entirely
-    }
-    S.lastHandSignature = signature;
-
-    handStrip.innerHTML = '';
-    hand.forEach(card => {
-      const el = makeCardEl(card, 'hand-card', st.trump_suit);
-
-      if (S.pendingReveal && myTurn) {
-        if (card === S.selectedRevealCard) el.classList.add('selected-for-reveal');
-        el.addEventListener('click', () => {
-          S.selectedRevealCard = card;
-          S.lastHandSignature = null; // force rebuild to reflect selection
-          renderGame();
-        });
-      } else if (myTurn) {
-        const isPlayable = legalSet.has(card);
-        if (isPlayable) {
-          el.classList.add('playable');
-          el.addEventListener('click', () => {
-            send({ type: 'play_card', card: card });
-          });
-        } else {
-          el.classList.add('disabled');
-        }
-      } else {
-        el.classList.add('disabled');
-      }
-      handStrip.appendChild(el);
-    });
-  }
-
-  // Compute a card width/height and negative overlap gap so `count` cards
-  // always fit within the strip's available width, crossfading crop over
-  // wide vs narrow viewports instead of ever introducing a scrollbar.
-  function sizeHandCards(handStrip, count) {
-    if (count <= 0) return;
-    const containerWidth = handStrip.parentElement.getBoundingClientRect().width || window.innerWidth;
-    const availW = Math.max(containerWidth - 12, 120);
-    const maxCardW = Math.min(64, Math.max(30, Math.floor(availW / Math.max(count * 0.55, 4))));
-    // width chosen so that with ~45% overlap between neighboring cards,
-    // the full fan fits: totalWidth = cardW + (count-1) * cardW * overlapFactor
-    let cardW = maxCardW;
-    let overlapFactor = 0.42;
-    for (let iter = 0; iter < 6; iter++) {
-      const totalWidth = cardW + (count - 1) * cardW * (1 - overlapFactor);
-      if (totalWidth <= availW) break;
-      overlapFactor += 0.05;
-      if (overlapFactor > 0.78) { cardW = Math.max(24, cardW - 2); overlapFactor = 0.5; }
-    }
-    const cardH = Math.round(cardW * 1.4);
-    // Negative gap isn't valid CSS (browsers ignore it), so overlap is done
-    // with a negative margin-left on every card after the first instead.
-    const overlapPx = Math.round(cardW * overlapFactor);
-    handStrip.style.gap = '0px';
-    handStrip.style.setProperty('--hand-card-w', cardW + 'px');
-    const styleTagId = 'hand-card-dyn-style';
-    let styleTag = document.getElementById(styleTagId);
-    if (!styleTag) {
-      styleTag = document.createElement('style');
-      styleTag.id = styleTagId;
-      document.head.appendChild(styleTag);
-    }
-    styleTag.textContent =
-      '.hand-card{width:' + cardW + 'px;height:' + cardH + 'px;}' +
-      '.hand-card + .hand-card{margin-left:-' + overlapPx + 'px;}' +
-      '.hand-card .hc-rank{font-size:' + Math.round(cardW * 0.32) + 'px;}' +
-      '.hand-card .hc-suit-big{font-size:' + Math.round(cardW * 0.5) + 'px;}';
-  }
-
-  window.addEventListener('resize', () => {
-    if (S.view === 'game' && S.gameState) {
-      S.lastHandSignature = null;
-      renderGame();
-    }
-  });
-
-  // ---------------- trump flash (suit reveal only - no text prompt, no toast) ----------------
-  function flashTrumpReveal(trumpSuit) {
-    const overlay = document.getElementById('trump-flash');
-    const symbolEl = document.getElementById('trump-flash-symbol');
-    symbolEl.textContent = SUIT_SYMBOL[trumpSuit];
-    symbolEl.className = 'stamp ' + (RED_SUITS.has(trumpSuit) ? 'red' : 'black');
-    overlay.classList.add('show');
-    setTimeout(() => overlay.classList.remove('show'), 1400);
-  }
-
-  // ---------------- result overlay ----------------
-  function showResultOverlay(winnerTeam, finalMendi) {
-    const overlay = document.getElementById('result-overlay');
-    const headline = document.getElementById('result-headline');
-    const sub = document.getElementById('result-sub');
-    const row = document.getElementById('result-mendi-row');
-
-    const myTeam = S.mySeat % 2 === 0 ? 'A' : 'B';
-    let mine = finalMendi[myTeam];
-    let theirs = finalMendi[myTeam === 'A' ? 'B' : 'A'];
-
-    if (winnerTeam === 'DRAW') {
-      headline.textContent = 'Draw';
-      headline.className = 'result-headline draw';
-      sub.textContent = '2 \u2013 2 split';
-    } else if (winnerTeam === myTeam) {
-      headline.textContent = 'You Win!';
-      headline.className = 'result-headline';
-      sub.textContent = mine + ' \u2013 ' + theirs;
-    } else {
-      headline.textContent = 'You Lose';
-      headline.className = 'result-headline draw';
-      sub.textContent = theirs + ' \u2013 ' + mine;
-    }
-
-    const mineSuits = [];
-    const theirsSuits = [];
-    const suitsWon = (S.gameState && S.gameState.mendi_suits_won) || {};
-    for (const seatStr in suitsWon) {
-      const seat = parseInt(seatStr, 10);
-      const team = seat % 2 === 0 ? 'A' : 'B';
-      const suits = suitsWon[seatStr] || [];
-      if (team === myTeam) mineSuits.push(...suits);
-      else theirsSuits.push(...suits);
-    }
-
-    row.innerHTML =
-      '<div class="mendi-counter mine"><div class="mendi-label">Your Team</div><div class="ten-slots" id="result-my-slots"></div></div>' +
-      '<div class="mendi-counter theirs"><div class="mendi-label">Opponents</div><div class="ten-slots" id="result-opp-slots"></div></div>';
-    renderTenSlots('result-my-slots', mineSuits, 'mine');
-    renderTenSlots('result-opp-slots', theirsSuits, 'theirs');
-
-    document.getElementById('btn-rematch').classList.toggle('hidden', S.mySeat !== 0);
-
-    overlay.classList.add('show');
-  }
-  function hideResultOverlay() {
-    document.getElementById('result-overlay').classList.remove('show');
-  }
-
-  // ---------------- boot ----------------
-  connect();
-})();
+}
+
+function render(){
+  var app=document.getElementById('app');
+  if(ST.view==='menu')app.innerHTML=menuH();
+  else if(ST.view==='hub')app.innerHTML=hubH();
+  else if(ST.view==='create'||ST.view==='join')app.innerHTML=cjH();
+  else if(ST.view==='game')app.innerHTML=gameH();
+  else if(ST.view==='result')app.innerHTML=resultH();
+  if(ST.view==='game')requestAnimationFrame(adjustH);
+}
+
+function menuH(){
+  return '<div class="menu-v"><div class="brand"><div class="chip"><div class="chip-in">M</div></div><div class="brand-t">MENDIKOT</div><div class="brand-s">Classic Indian Card Game</div></div>'
+  +'<div class="card-fan" aria-hidden="true"><div class="fc" style="color:var(--red)">'+SYM.H+'</div><div class="fc" style="color:var(--dark)">'+SYM.S+'</div><div class="fc" style="color:var(--red)">'+SYM.D+'</div><div class="fc" style="color:var(--dark)">'+SYM.C+'</div><div class="fc" style="color:var(--red)">'+SYM.H+'</div></div>'
+  +'<div class="menu-form"><label class="flbl" for="pn">Your Name</label>'
+  +'<input class="finp" id="pn" type="text" maxlength="16" placeholder="Enter your name" value="'+h(ST.name)+'" autocomplete="off" oninput="ST.name=this.value;localStorage.setItem(\'mdk_n\',this.value)"></div>'
+  +'<div class="menu-btns">'
+  +'<button class="btn btn-gold btn-w" id="btn-solo" onclick="startSolo()"><svg class="btn-ico" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>Solo vs Bots</button>'
+  +'<button class="btn btn-ghost btn-w" id="btn-fr" onclick="goTo(\'hub\')"><svg class="btn-ico" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>Play with Friends</button>'
+  +'</div><p style="color:var(--muted);font-size:.78rem;text-align:center;max-width:250px">Capture the four 10s (mendi) to win &middot; 4 players &middot; 2 teams &middot; 13 tricks</p></div>';
+}
+
+function hubH(){return '<div class="hub-v"><button class="back-btn" onclick="goTo(\'menu\')">&larr; Back</button><div><div class="view-t">Play with Friends</div><p style="color:var(--muted);font-size:.78rem;text-align:center">Create or join a room</p></div><div class="hub-row"><div class="hub-c" onclick="goTo(\'create\')" role="button" tabindex="0"><div class="hub-ico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg></div><div class="hub-ct">Create Room</div><div class="hub-cd">Host a new game</div></div><div class="hub-c" onclick="goTo(\'join\')" role="button" tabindex="0"><div class="hub-ico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg></div><div class="hub-ct">Join Room</div><div class="hub-cd">Enter a code</div></div></div><div style="max-width:290px;background:rgba(0,0,0,.2);border:1px solid var(--bdr);border-radius:var(--r2);padding:.9rem;text-align:center"><div style="color:var(--gold);font-family:\'Playfair Display\',serif;font-size:.95rem;margin-bottom:.35rem">Multiplayer Coming Soon</div><p style="color:var(--muted);font-size:.75rem">Server is ready &mdash; multiplayer support in next update!</p></div><button class="btn btn-gold btn-sm" onclick="startSolo()">&#9654; Play Solo vs Bots</button></div>';}
+
+function cjH(){return '<div class="form-v"><button class="back-btn" onclick="goTo(\'hub\')">&larr; Back</button><div class="view-t">Coming Soon</div><div class="fpanel" style="text-align:center;gap:1rem"><div style="font-size:2.4rem">&#128679;</div><div style="color:var(--gold);font-family:\'Playfair Display\',serif">Multiplayer Under Development</div><p style="color:var(--muted);font-size:.8rem">WebSocket server is ready &mdash; room system coming next!</p><button class="btn btn-gold btn-w" onclick="startSolo()">Play Solo vs Bots</button><button class="btn btn-ghost btn-sm btn-w" onclick="goTo(\'hub\')">&larr; Back</button></div></div>';}
+
+function gameH(){
+  var g=ST.gs;if(!g)return'<div class="game-v"></div>';
+  var hand=g.hand||[];
+  var tsStr=g.tout&&g.trump?g.trump.s:null;
+  var vset=new Set((g.vplays||[]).map(function(c){return ck(c);}));
+  var mr=g.must_reveal;
+  var hturn=g.whose===0&&!g.paused&&!g.done;
+  var bsl={};
+  (g.trick.cards||[]).forEach(function(tc){bsl[tc.seat]=tc.c;});
+  var mnA=g.mendi_suits?g.mendi_suits.A:[];
+  var mnB=g.mendi_suits?g.mendi_suits.B:[];
+  var btxt='',bdng=false;
+  if(g.paused)btxt='Trick complete\u2026';
+  else if(hturn&&mr){btxt='You\'re void \u2014 tap any card to reveal trump!';bdng=true;}
+  else if(hturn)btxt='Your turn \u2014 pick a card';
+  else btxt=h(g.players[g.whose].name)+'\'s turn\u2026';
+  return '<div class="game-v">'+sbarH(g,mnA,mnB)
+  +'<div class="felt"><div class="deco tl">'+SYM.S+'</div><div class="deco tr">'+SYM.H+'</div><div class="deco bl">'+SYM.C+'</div><div class="deco br">'+SYM.D+'</div>'
+  +seatH(g,2,'top')+seatH(g,3,'left')+seatH(g,1,'right')
+  +'<div class="trickc">'+tslH(bsl,2,'T',tsStr)+tslH(bsl,0,'B',tsStr)+tslH(bsl,3,'L',tsStr)+tslH(bsl,1,'R',tsStr)+'</div>'
+  +'<div class="finfo tr"><div class="ppill">'+(g.ph1?'Phase 1':'Phase 2')+' &middot; Trick '+(g.tnum+1)+'/13</div></div>'
+  +'<div class="finfo bc"><div class="tcnt">A: '+g.team_mn[0]+' mendi &nbsp;&middot;&nbsp; B: '+g.team_mn[1]+' mendi</div></div>'
+  +'<div class="turn-b'+(bdng?' d':'')+'" id="tnbanner">'+btxt+'</div></div>'
+  +'<div class="hstrip"><div class="hlbl">'+h(g.players[0].name)+' &middot; Team A</div>'
+  +'<div class="hinner" id="hinner">'+handH(hand,vset,mr,hturn,tsStr)+'</div></div></div>';
+}
+
+function sbarH(g,mnA,mnB){
+  var ts=g.tout&&g.trump?g.trump.s:null;
+  return '<div class="sbar"><div class="sside"><div><div class="slbl">Team A</div><div class="mtrack">'+pipsH(mnA)+'</div></div><div class="mnum">'+g.team_mn[0]+'</div></div>'
+  +'<div class="twrap"><div class="tlbl">Trump</div>'
+  +'<div class="tmini '+(ts?'sho':'hid')+'">'+(ts?'<div class="tface" style="color:'+(isRed({s:ts})?'var(--red)':'var(--dark)')+'"><span>'+rd(g.trump.c.r)+'</span><span class="ts">'+SYM[ts]+'</span></div>':'')+'</div></div>'
+  +'<div class="sside r"><div class="mnum">'+g.team_mn[1]+'</div><div><div class="slbl" style="text-align:right">Team B</div><div class="mtrack" style="flex-direction:row-reverse">'+pipsH(mnB)+'</div></div></div></div>';
+}
+
+function pipsH(suits){return SUITS.map(function(s){var w=suits&&suits.indexOf(s)>=0;return'<div class="mpip'+(w?' won':'')+'" title="'+SNAME[s]+' 10"><span style="color:'+(w?(isRed({s:s})?'var(--red)':'var(--dark)'):'rgba(255,255,255,.1)')+'">'+SYM[s]+'</span></div>';}).join('');}
+
+function seatH(g,seat,pos){
+  var p=g.players[seat];var act=g.whose===seat&&!g.paused&&!g.done;var init=p.name.substring(0,2).toUpperCase();var thinking=act&&p.bot;
+  var pips=Math.min(g.opp_sizes?g.opp_sizes[seat]:0,8);
+  var ph='';for(var i=0;i<pips;i++)ph+='<div class="opip" style="z-index:'+i+'"></div>';
+  return '<div class="seat '+pos+'"><div class="sav'+(p.bot?' bot':'')+(act?' act':'')+'">'+init+(thinking?'<div class="thdot-wrap"><div class="td"></div><div class="td"></div><div class="td"></div></div>':'')+'</div><div class="snm">'+h(p.name)+'</div><div class="sbadge '+p.team.toLowerCase()+'">'+p.team+'</div>'+(ph?'<div class="opips">'+ph+'</div>':'')+'</div>';
+}
+
+function tslH(bsl,seat,pos,ts){var c=bsl[seat];return'<div class="tslot '+pos+'">'+(c?'<div class="tsin">'+cFaceH(c,false,ts)+'</div>':'')+'</div>';}
+
+function cFaceH(c,dis,ts){
+  var col=isRed(c)?'red':'black';
+  var cls=['card',col,dis?'dis':'',ts&&c.s===ts?'istr':'',isMn(c)?'ismn':''].filter(Boolean).join(' ');
+  return '<div class="'+cls+'"><div class="cr"><span>'+rd(c.r)+'</span><span class="sm">'+SYM[c.s]+'</span></div><div class="cs">'+SYM[c.s]+'</div><div class="crb"><span>'+rd(c.r)+'</span><span class="sm">'+SYM[c.s]+'</span></div></div>';
+}
+
+function handH(hand,vset,mr,hturn,ts){
+  if(!hand.length)return'';
+  var sorted=[...hand].sort(function(a,b){var sd=SUITS.indexOf(a.s)-SUITS.indexOf(b.s);return sd!==0?sd:a.r-b.r;});
+  return sorted.map(function(c,i){
+    var key=ck(c);var valid=vset.has(key);var play=hturn&&valid,dis=hturn&&!valid;
+    var col=isRed(c)?'red':'black';var cls=['card',col,play?'play':'',dis?'dis':'',ts&&c.s===ts?'istr':'',isMn(c)?'ismn':''].filter(Boolean).join(' ');
+    var oc=play?'onclick="onCC(\''+key+'\','+mr+')"':' ';
+    return '<div class="hcw" style="animation-delay:'+(i*.04)+'s"><div class="'+cls+'" '+oc+' role="'+(play?'button':'')+'" aria-label="'+rd(c.r)+' of '+SNAME[c.s]+'">'
+    +'<div class="cr"><span>'+rd(c.r)+'</span><span class="sm">'+SYM[c.s]+'</span></div><div class="cs">'+SYM[c.s]+'</div><div class="crb"><span>'+rd(c.r)+'</span><span class="sm">'+SYM[c.s]+'</span></div></div></div>';
+  }).join('');
+}
+
+function resultH(){
+  var g=ST.gs;var tA=g.team_mn[0],tB=g.team_mn[1];
+  var mA=g.mendi_suits?g.mendi_suits.A:[];var mB=g.mendi_suits?g.mendi_suits.B:[];
+  var title=tA>tB?'Team A Wins!':tB>tA?'Team B Wins!':"It's a Draw!";var trophy=tA===tB?'\uD83E\uDD1D':'\uD83C\uDFC6';
+  function mrow(suits){return suits&&suits.length?suits.map(function(s){return'<div class="rmc" style="color:'+(isRed({s:s})?'var(--red)':'var(--dark)')+'">'+SYM[s]+'</div>';}).join(''):'<span style="color:var(--muted);font-size:.75rem;padding:.4rem">None</span>';}
+  var desc=tA===4?'Perfect sweep! Team A got all 4 mendi!':tB===4?'Perfect sweep! Team B got all 4!':tA===tB?'Equal mendi \u2014 dead heat!':'Team '+(tA>tB?'A':'B')+' captured more mendi';
+  return '<div class="res-v"><div class="rtrophy">'+trophy+'</div><h1 class="rtitle">'+title+'</h1>'
+  +'<div class="rscores"><div class="rteam"><div class="rteam-l">Team A</div><div class="rmrow">'+mrow(mA)+'</div><div class="rnum">'+tA+'</div></div><div class="rvs">vs</div><div class="rteam"><div class="rteam-l">Team B</div><div class="rmrow">'+mrow(mB)+'</div><div class="rnum">'+tB+'</div></div></div>'
+  +'<p style="color:var(--muted);font-size:.82rem;text-align:center">'+desc+'</p>'
+  +'<div class="rbtns"><button class="btn btn-gold" onclick="startSolo()">Play Again</button><button class="btn btn-ghost" onclick="goTo(\'menu\')">Menu</button></div></div>';
+}
+
+function adjustH(){var inner=document.getElementById('hinner');if(!inner)return;var cards=inner.querySelectorAll('.hcw');if(cards.length<2)return;var avail=inner.offsetWidth-10;var cw=cards[0].offsetWidth;var total=cards.length*cw+(cards.length-1)*3;if(total>avail){var ov=(total-avail)/(cards.length-1);cards.forEach(function(c,i){if(i>0)c.style.marginLeft='-'+ov+'px';});}}
+
+function onCC(key,mr){
+  var g=ST.gs;if(!g||g.whose!==0||g.paused||g.done)return;
+  var card=g.hand.find(function(c){return ck(c)===key;});if(!card)return;
+  if(mr)showTSel();else wsSend({type:'play_card',card:{s:card.s,r:card.r},is_reveal:false});
+}
+
+function showTSel(){
+  var g=ST.gs;var old=document.getElementById('tsel');if(old)old.remove();
+  var el=document.createElement('div');el.id='tsel';el.className='tsel';
+  var ledName=g.trick.led?SNAME[g.trick.led]:'that suit';
+  var grid=(g.hand||[]).map(function(c){return'<div class="tsel-c" onclick="pickT(\''+ck(c)+'\')" role="button" aria-label="'+rd(c.r)+' of '+SNAME[c.s]+'">'+cFaceH(c,false,null)+'</div>';}).join('');
+  el.innerHTML='<div class="tsel-t">Reveal Trump</div><div class="tsel-s">No '+ledName+' cards &mdash; pick any card as trump. It is immediately played.</div><div class="tsel-grid">'+grid+'</div><button class="btn btn-ghost btn-sm" style="margin-bottom:1rem" onclick="document.getElementById(\'tsel\').remove()">Cancel</button>';
+  document.body.appendChild(el);
+}
+
+function pickT(key){
+  var el=document.getElementById('tsel');if(el)el.remove();
+  var g=ST.gs;var card=g.hand.find(function(c){return ck(c)===key;});if(!card)return;
+  wsSend({type:'play_card',card:{s:card.s,r:card.r},is_reveal:true});
+}
+
+function showTFlash(suit,pname){
+  var ov=document.getElementById('tflash');var se=document.getElementById('fsym');var te=document.getElementById('ftxt');var su=document.getElementById('fsub');if(!ov)return;
+  ov.style.background=FBGS[suit]||'rgba(40,40,100,.9)';se.textContent=SYM[suit];se.style.color=isRed({s:suit})?'#ff8888':'#ccccff';te.textContent=SNAME[suit]+' is Trump!';su.textContent=pname+' revealed the trump suit';
+  ov.classList.remove('show');void ov.offsetWidth;ov.classList.add('show');setTimeout(function(){ov.classList.remove('show');},3100);
+}
+
+function bootAnim(){
+  var el=document.createElement('div');el.className='boot-ov';
+  var bc='';for(var i=0;i<8;i++)bc+='<div class="bca" style="animation-delay:'+(i*.07)+'s"></div>';
+  el.innerHTML='<div class="boot-t">Dealing Cards</div><p style="color:var(--muted);font-size:.8rem">8 more cards each!</p><div class="boot-cards">'+bc+'</div>';
+  document.body.appendChild(el);setTimeout(function(){el.remove();},2000);
+}
+
+function toast(msg){var c=document.getElementById('toasts');if(!c)return;var t=document.createElement('div');t.className='toast';t.textContent=msg;c.appendChild(t);setTimeout(function(){t.remove();},3000);}
+
+function confetti(){
+  var cols=['#d4af37','#f5d86e','#27ae60','#e74c3c','#5dade2','#af7ac5','#fff'];
+  for(var i=0;i<90;i++){var p=document.createElement('div');p.className='conf';p.style.left=Math.random()*100+'vw';p.style.background=cols[0|Math.random()*cols.length];p.style.width=(5+Math.random()*7)+'px';p.style.height=(5+Math.random()*7)+'px';p.style.animationDuration=(1.8+Math.random()*2.4)+'s';p.style.animationDelay=(Math.random()*.9)+'s';document.body.appendChild(p);setTimeout(function(){p.remove();},5000);}
+}
+
+function goTo(v){ST.view=v;render();}
+function startSolo(){var name=ST.name.trim()||'You';wsSend({type:'solo_start',name:name});}
+
+render();
+initWS();
+window.addEventListener('resize',function(){if(ST.view==='game')requestAnimationFrame(adjustH);});
 </script>
 </body>
 </html>
 """
 
+# ════ ROOM MANAGER ════
+rooms: Dict[str,dict]={}; ws_map: Dict[str,WebSocket]={}; pid_room: Dict[str,str]={}
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return INDEX_HTML
+def gen_code():
+    chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    while True:
+        c=''.join(random.choices(chars,k=4))
+        if c not in rooms: return c
 
+async def push(pid,data):
+    w=ws_map.get(pid)
+    if w:
+        try: await w.send_json(data)
+        except: pass
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def push_state(rc,evts=None):
+    room=rooms.get(rc)
+    if not room or not room.get('game'): return
+    g=room['game']
+    for pid,info in room['players'].items():
+        if not info.get('bot'):
+            st=g.state(info['seat'])
+            await push(pid,{'type':'state','state':st,'events':evts or []})
+
+async def bot_loop(rc):
+    while True:
+        await asyncio.sleep(0.08)
+        room=rooms.get(rc)
+        if not room or not room.get('game'): break
+        g=room['game']
+        if g.done or g.paused: break
+        bot_pid=next((pid for pid,info in room['players'].items() if info['seat']==g.whose and info.get('bot')),None)
+        if not bot_pid: break
+        await asyncio.sleep(0.65+random.random()*0.45)
+        room=rooms.get(rc)
+        if not room or not room.get('game'): break
+        g=room['game']
+        card,rev=g.bot_card(g.whose)
+        if not card: break
+        evts=g.play(g.whose,card,rev)
+        if 'trick_complete' in evts:
+            g.paused=True
+            await push_state(rc,evts)
+            await asyncio.sleep(2.2)
+            room=rooms.get(rc)
+            if not room or not room.get('game'): break
+            g=room['game']
+            _,more=g.resolve()
+            if 'game_done' in more:
+                await push_state(rc,more); break
+            await push_state(rc,more)
+        else:
+            await push_state(rc,evts)
+
+# ════ FASTAPI ════
+app=FastAPI()
+
+@app.get('/')
+async def index(): return HTMLResponse(HTML)
+
+@app.websocket('/ws')
+async def ws_ep(ws:WebSocket):
+    await ws.accept()
+    pid=str(uuid.uuid4()); ws_map[pid]=ws
+    try:
+        while True:
+            raw=await ws.receive_text()
+            msg=json.loads(raw); mt=msg.get('type')
+
+            if mt=='solo_start':
+                name=str(msg.get('name','You'))[:16]
+                rc=gen_code()
+                players={
+                    pid:{'seat':0,'name':name,'bot':False,'team':'A'},
+                    'b1':{'seat':1,'name':'Rajan','bot':True,'team':'B'},
+                    'b2':{'seat':2,'name':'Deepak','bot':True,'team':'A'},
+                    'b3':{'seat':3,'name':'Priya','bot':True,'team':'B'},
+                }
+                gp=[{'name':v['name'],'seat':v['seat'],'bot':v['bot'],'team':v['team']} for v in sorted(players.values(),key=lambda x:x['seat'])]
+                game=Game(gp); rooms[rc]={'players':players,'game':game,'mode':'solo'}; pid_room[pid]=rc
+                await push_state(rc,['game_started'])
+                if game.players[game.whose]['bot']: asyncio.create_task(bot_loop(rc))
+
+            elif mt=='play_card':
+                rc=pid_room.get(pid)
+                if not rc: continue
+                room=rooms.get(rc)
+                if not room or not room.get('game'): continue
+                g=room['game']; seat=room['players'].get(pid,{}).get('seat',-1)
+                if g.whose!=seat or g.paused or g.done: continue
+                cd=msg.get('card')
+                if not cd: continue
+                hc=next((c for c in g.hands[seat] if c['s']==cd.get('s') and c['r']==cd.get('r')),None)
+                if not hc: continue
+                evts=g.play(seat,hc,bool(msg.get('is_reveal',False)))
+                if 'trick_complete' in evts:
+                    g.paused=True
+                    await push_state(rc,evts)
+                    await asyncio.sleep(2.2)
+                    room=rooms.get(rc)
+                    if not room: continue
+                    g=room['game']; _,more=g.resolve()
+                    if 'game_done' in more:
+                        await push_state(rc,more); continue
+                    await push_state(rc,more)
+                    if g.players[g.whose]['bot']: asyncio.create_task(bot_loop(rc))
+                else:
+                    await push_state(rc,evts)
+                    if not g.done and g.players[g.whose]['bot']: asyncio.create_task(bot_loop(rc))
+
+    except WebSocketDisconnect: pass
+    finally:
+        ws_map.pop(pid,None); rc=pid_room.pop(pid,None)
+        if rc and rc in rooms and rooms[rc].get('mode')=='solo': rooms.pop(rc,None)
+
+if __name__=='__main__':
+    print('\n  Mendikot server starting...')
+    print('  Open http://localhost:8000 in your browser\n')
+    uvicorn.run(app,host='0.0.0.0',port=8000,log_level='warning')
