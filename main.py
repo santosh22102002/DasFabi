@@ -1221,12 +1221,228 @@ function ConfirmExit({ onConfirm, onCancel }) {
   );
 }
 
+// ===================== SUB-COMPONENTS =====================
+
+function MenuView({ onSolo, onHub }) {
+  return (
+    <div className="view">
+      <div className="menu-title">MENDIKOT</div>
+      <div className="menu-sub">The Classic Indian Card Game</div>
+      <button className="menu-btn primary" onClick={onSolo}>Solo vs Bots</button>
+      <button className="menu-btn secondary" onClick={onHub}>Play with Friends</button>
+    </div>
+  );
+}
+
+function SoloSetupView({ playerName, onBack, onStart }) {
+  const [name, setName] = useState(playerName);
+  const [team, setTeam] = useState('A');
+  return (
+    <div className="view">
+      <div className="form-card">
+        <div className="form-title">Solo Setup</div>
+        <div className="input-group">
+          <label>Your Name</label>
+          <input value={name} onChange={e => setName(e.target.value)} placeholder="Enter name" maxLength={12} />
+        </div>
+        <label style={{fontSize:'0.85rem',color:'rgba(255,255,255,0.7)',marginBottom:'8px',display:'block'}}>Choose Team</label>
+        <div className="team-select">
+          <div className={`team-option team-a ${team==='A'?'active':''}`} onClick={() => setTeam('A')}>Team A</div>
+          <div className={`team-option team-b ${team==='B'?'active':''}`} onClick={() => setTeam('B')}>Team B</div>
+        </div>
+        <div className="form-actions">
+          <button className="btn-back" onClick={onBack}>Back</button>
+          <button className="btn-submit" onClick={() => { if(name.trim()) onStart(name.trim(), team); }}>Start Game</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HubView({ playerName, onBack, onCreate, onJoin, errorMsg }) {
+  const [name, setName] = useState(playerName);
+  const [code, setCode] = useState('');
+  const [team, setTeam] = useState('A');
+  const [mode, setMode] = useState('create');
+  return (
+    <div className="view">
+      <div className="form-card">
+        <div className="form-title">Play with Friends</div>
+        <div style={{display:'flex',gap:8,marginBottom:16}}>
+          <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='create'?1:0.5}} onClick={()=>setMode('create')}>Create</button>
+          <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='join'?1:0.5}} onClick={()=>setMode('join')}>Join</button>
+        </div>
+        <div className="input-group">
+          <label>Your Name</label>
+          <input value={name} onChange={e => setName(e.target.value)} placeholder="Enter name" maxLength={12} />
+        </div>
+        {mode === 'join' && (
+          <div className="input-group">
+            <label>Room Code</label>
+            <input value={code} onChange={e => setCode(e.target.value.toUpperCase())} placeholder="ABCD" maxLength={4} />
+          </div>
+        )}
+        <label style={{fontSize:'0.85rem',color:'rgba(255,255,255,0.7)',marginBottom:'8px',display:'block'}}>Choose Team</label>
+        <div className="team-select">
+          <div className={`team-option team-a ${team==='A'?'active':''}`} onClick={() => setTeam('A')}>Team A</div>
+          <div className={`team-option team-b ${team==='B'?'active':''}`} onClick={() => setTeam('B')}>Team B</div>
+        </div>
+        {errorMsg && <div style={{color:'#ff8a8a',fontSize:'0.85rem',marginBottom:10,textAlign:'center'}}>{errorMsg}</div>}
+        <div className="form-actions">
+          <button className="btn-back" onClick={onBack}>Back</button>
+          <button className="btn-submit" onClick={() => {
+            if(!name.trim()) return;
+            if(mode==='create') onCreate(name.trim(), team);
+            else if(code.trim().length===4) onJoin(name.trim(), code.trim(), team);
+          }}>{mode==='create'?'Create Room':'Join Room'}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LobbyView({ roomCode, seat, players, onStart, onLeave, isHost, isFull }) {
+  return (
+    <div className="view">
+      <div className="form-title">Lobby</div>
+      <div className="room-code">{roomCode}</div>
+      <div style={{textAlign:'center',opacity:0.6,fontSize:'0.85rem',marginBottom:10}}>Share this code with friends</div>
+      <div className="seats-grid">
+        {players.map((p,i) => (
+          <div key={i} className={`seat ${p?'filled':''}`}>
+            <div className="seat-name">{p ? p.name : 'Open'}</div>
+            <div className="seat-team">Team {p ? p.team : (i%2===0?'A':'B')}</div>
+            {p && <div className={`seat-status ${i===0?'status-host':'status-waiting'}`}>{i===0?'Host':'Waiting'}</div>}
+          </div>
+        ))}
+      </div>
+      {isHost ? (
+        <button className="start-btn" disabled={!isFull} onClick={onStart}>Start Game</button>
+      ) : (
+        <div style={{opacity:0.6,fontSize:'0.9rem'}}>Waiting for host to start...</div>
+      )}
+      <button className="menu-btn secondary" style={{marginTop:16}} onClick={onLeave}>Leave Room</button>
+    </div>
+  );
+}
+
+function GameView({ gameState, trick, seat, onPlayCard, onRevealTrump, onRematch, onExit, showTrumpFlash, flashSuit, onTrumpDone, paused, handComplete, result, toasts, confirmExit, onConfirmExit, onCancelExit }) {
+  const myHand = gameState?.your_hand || [];
+  const allPlayers = gameState?.players || [];
+  const handCount = myHand.length;
+  const overlap = handCount > 6 ? -(Math.min(28, (handCount-6)*4)) : 0;
+  const seatPositions = ['bottom','left','top','right'];
+
+  return (
+    <div className="game-view">
+      <button className="exit-btn" onClick={onConfirmExit}>×</button>
+      <div className="trick-counter">Trick {Math.min(gameState?.trick_number || 1, 13)} / 13</div>
+
+      <div className="score-cluster">
+        <div className="score-side">
+          <span className="score-label">Team A</span>
+          <span className="score-number score-team-a">{gameState?.scores?.A || 0}</span>
+          <div className="mendi-strip">
+            {(gameState?.mendi?.A || []).map((c,i) => (
+              <div key={i} className="mendi-mini" style={{color: SUIT_COLORS[c.suit]==='red'?'#c41e3a':'#1a1a1a'}}>{c.suit}</div>
+            ))}
+          </div>
+        </div>
+        <div className="trump-slot">
+          <span className="trump-label">Trump</span>
+          {gameState?.trump_suit ? (
+            <div className="trump-card-mini" style={{color: SUIT_COLORS[gameState.trump_suit]==='red'?'#c41e3a':'#1a1a1a'}}>{gameState.trump_suit}</div>
+          ) : (
+            <div className="trump-unknown">?</div>
+          )}
+        </div>
+        <div className="score-side">
+          <span className="score-label">Team B</span>
+          <span className="score-number score-team-b">{gameState?.scores?.B || 0}</span>
+          <div className="mendi-strip">
+            {(gameState?.mendi?.B || []).map((c,i) => (
+              <div key={i} className="mendi-mini" style={{color: SUIT_COLORS[c.suit]==='red'?'#c41e3a':'#1a1a1a'}}>{c.suit}</div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="table-felt">
+        <div className="felt-ellipse" />
+        {[2,1,3,0].map(s => {
+          const pos = seatPositions[s];
+          const isActive = gameState?.turn === s && !paused && !handComplete;
+          const isDealer = gameState?.dealer === s;
+          const pl = allPlayers[s];
+          return (
+            <div key={s} className={`seat-marker ${pos} ${isActive ? 'active' : ''}`}>
+              <div style={{position:'relative'}}>
+                <div className="seat-avatar">{s === seat ? '👤' : '🤖'}</div>
+                {isDealer && <div className="dealer-chip" style={{top:-4,right:-4}}>D</div>}
+              </div>
+              <div className="seat-name-tag" style={{color: pl?.team==='A'?'#6bb5ff':'#ff8a8a'}}>
+                {pl ? pl.name : 'Open'}
+              </div>
+              {s !== seat && pl?.is_bot && <div className="bot-badge">BOT</div>}
+            </div>
+          );
+        })}
+
+        <div className="trick-center">
+          {trick.map((t, i) => {
+            const pos = (t.seat + 4 - seat) % 4;
+            return (
+              <div key={`${t.card.id}-${i}`} className={`trick-card-wrapper pos-${pos}`}>
+                <Card card={t.card} />
+                {t.is_reveal && <div style={{position:'absolute',top:-20,left:'50%',transform:'translateX(-50%)',background:'var(--accent-gold)',color:'#1a1a1a',padding:'2px 8px',borderRadius:'10px',fontSize:'0.65rem',fontWeight:'800',whiteSpace:'nowrap'}}>TRUMP!</div>}
+              </div>
+            );
+          })}
+        </div>
+
+        {paused && <div className="pause-indicator">Collecting trick...</div>}
+      </div>
+
+      {gameState?.turn === seat && !paused && !handComplete && gameState?.phase === 'phase1' && !gameState?.trump_suit && gameState?.trick?.length > 0 && (
+        <button className="reveal-btn" onClick={onRevealTrump}>
+          Reveal Trump (lowest card)
+        </button>
+      )}
+
+      <div className="hand-strip">
+        {myHand.map((card, i) => (
+          <div key={card.id} className="hand-card-wrapper" style={{marginLeft: i>0 ? `${overlap}px` : 0, zIndex: i}}>
+            <Card
+              card={card}
+              disabled={gameState?.turn !== seat || paused || handComplete}
+              onClick={() => onPlayCard(card.id)}
+            />
+          </div>
+        ))}
+      </div>
+
+      {showTrumpFlash && <TrumpFlash suit={flashSuit} onDone={onTrumpDone} />}
+      {handComplete && (
+        <ResultOverlay
+          result={result}
+          scores={gameState?.scores || {A:0,B:0}}
+          mendi={gameState?.mendi || {A:[],B:[]}}
+          onRematch={onRematch}
+          onExit={onExit}
+        />
+      )}
+      {confirmExit && <ConfirmExit onConfirm={onExit} onCancel={onCancelExit} />}
+      <ToastContainer toasts={toasts} />
+    </div>
+  );
+}
+
+// ===================== MAIN APP =====================
+
 function App() {
   const [view, setView] = useState('menu');
   const [playerName, setPlayerName] = useState(localStorage.getItem('mendikot_name') || '');
-  const [ws, setWs] = useState(null);
   const [roomCode, setRoomCode] = useState('');
-  const [playerId, setPlayerId] = useState('');
   const [seat, setSeat] = useState(null);
   const [players, setPlayers] = useState([null,null,null,null]);
   const [gameState, setGameState] = useState(null);
@@ -1251,19 +1467,13 @@ function App() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
     wsRef.current = socket;
-    socket.onopen = () => {
-      setWs(socket);
-    };
+    socket.onopen = () => {};
     socket.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       handleMessage(msg);
     };
-    socket.onclose = () => {
-      setWs(null);
-    };
-    socket.onerror = () => {
-      setWs(null);
-    };
+    socket.onclose = () => {};
+    socket.onerror = () => {};
   }, []);
 
   const send = useCallback((msg) => {
@@ -1276,7 +1486,6 @@ function App() {
     const type = msg.type;
     if (type === 'room_created') {
       setRoomCode(msg.room_code);
-      setPlayerId(msg.player_id);
       setSeat(msg.seat);
       setPlayers(msg.players);
       setView(msg.solo ? 'game' : 'lobby');
@@ -1289,7 +1498,6 @@ function App() {
       }
     } else if (type === 'room_joined') {
       setRoomCode(msg.room_code);
-      setPlayerId(msg.player_id);
       setSeat(msg.seat);
       setPlayers(msg.players);
       setView('lobby');
@@ -1403,235 +1611,79 @@ function App() {
     setTimeout(() => connect(), 300);
   };
 
-  // ===================== VIEWS =====================
-
+  // Render views
   if (view === 'menu') {
     return (
       <div className="app">
-        <div className="view">
-          <div className="menu-title">MENDIKOT</div>
-          <div className="menu-sub">The Classic Indian Card Game</div>
-          <button className="menu-btn primary" onClick={() => setView('solo-setup')}>Solo vs Bots</button>
-          <button className="menu-btn secondary" onClick={() => setView('hub')}>Play with Friends</button>
-        </div>
+        <MenuView onSolo={() => setView('solo-setup')} onHub={() => setView('hub')} />
       </div>
     );
   }
 
   if (view === 'solo-setup') {
-    const [name, setName] = useState(playerName);
-    const [team, setTeam] = useState('A');
     return (
       <div className="app">
-        <div className="view">
-          <div className="form-card">
-            <div className="form-title">Solo Setup</div>
-            <div className="input-group">
-              <label>Your Name</label>
-              <input value={name} onChange={e => setName(e.target.value)} placeholder="Enter name" maxLength={12} />
-            </div>
-            <label style={{fontSize:'0.85rem',color:'rgba(255,255,255,0.7)',marginBottom:'8px',display:'block'}}>Choose Team</label>
-            <div className="team-select">
-              <div className={`team-option team-a ${team==='A'?'active':''}`} onClick={() => setTeam('A')}>Team A</div>
-              <div className={`team-option team-b ${team==='B'?'active':''}`} onClick={() => setTeam('B')}>Team B</div>
-            </div>
-            <div className="form-actions">
-              <button className="btn-back" onClick={() => setView('menu')}>Back</button>
-              <button className="btn-submit" onClick={() => { if(name.trim()) startSolo(name.trim(), team); }}>Start Game</button>
-            </div>
-          </div>
-        </div>
+        <SoloSetupView
+          playerName={playerName}
+          onBack={() => setView('menu')}
+          onStart={startSolo}
+        />
       </div>
     );
   }
 
   if (view === 'hub') {
-    const [name, setName] = useState(playerName);
-    const [code, setCode] = useState('');
-    const [team, setTeam] = useState('A');
-    const [mode, setMode] = useState('create');
     return (
       <div className="app">
-        <div className="view">
-          <div className="form-card">
-            <div className="form-title">Play with Friends</div>
-            <div style={{display:'flex',gap:8,marginBottom:16}}>
-              <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='create'?1:0.5}} onClick={()=>setMode('create')}>Create</button>
-              <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='join'?1:0.5}} onClick={()=>setMode('join')}>Join</button>
-            </div>
-            <div className="input-group">
-              <label>Your Name</label>
-              <input value={name} onChange={e => setName(e.target.value)} placeholder="Enter name" maxLength={12} />
-            </div>
-            {mode === 'join' && (
-              <div className="input-group">
-                <label>Room Code</label>
-                <input value={code} onChange={e => setCode(e.target.value.toUpperCase())} placeholder="ABCD" maxLength={4} />
-              </div>
-            )}
-            <label style={{fontSize:'0.85rem',color:'rgba(255,255,255,0.7)',marginBottom:'8px',display:'block'}}>Choose Team</label>
-            <div className="team-select">
-              <div className={`team-option team-a ${team==='A'?'active':''}`} onClick={() => setTeam('A')}>Team A</div>
-              <div className={`team-option team-b ${team==='B'?'active':''}`} onClick={() => setTeam('B')}>Team B</div>
-            </div>
-            {errorMsg && <div style={{color:'#ff8a8a',fontSize:'0.85rem',marginBottom:10,textAlign:'center'}}>{errorMsg}</div>}
-            <div className="form-actions">
-              <button className="btn-back" onClick={() => setView('menu')}>Back</button>
-              <button className="btn-submit" onClick={() => {
-                if(!name.trim()) return;
-                if(mode==='create') createRoom(name.trim(), team);
-                else if(code.trim().length===4) joinRoom(name.trim(), code.trim(), team);
-              }}>{mode==='create'?'Create Room':'Join Room'}</button>
-            </div>
-          </div>
-        </div>
+        <HubView
+          playerName={playerName}
+          onBack={() => setView('menu')}
+          onCreate={createRoom}
+          onJoin={joinRoom}
+          errorMsg={errorMsg}
+        />
       </div>
     );
   }
 
   if (view === 'lobby') {
-    const isHost = seat === 0;
-    const full = players.every(p => p !== null);
     return (
       <div className="app">
-        <div className="view">
-          <div className="form-title">Lobby</div>
-          <div className="room-code">{roomCode}</div>
-          <div style={{textAlign:'center',opacity:0.6,fontSize:'0.85rem',marginBottom:10}}>Share this code with friends</div>
-          <div className="seats-grid">
-            {players.map((p,i) => (
-              <div key={i} className={`seat ${p?'filled':''}`}>
-                <div className="seat-name">{p ? p.name : 'Open'}</div>
-                <div className="seat-team">Team {p ? p.team : (i%2===0?'A':'B')}</div>
-                {p && <div className={`seat-status ${i===0?'status-host':'status-waiting'}`}>{i===0?'Host':'Waiting'}</div>}
-              </div>
-            ))}
-          </div>
-          {isHost ? (
-            <button className="start-btn" disabled={!full} onClick={startGame}>Start Game</button>
-          ) : (
-            <div style={{opacity:0.6,fontSize:'0.9rem'}}>Waiting for host to start...</div>
-          )}
-          <button className="menu-btn secondary" style={{marginTop:16}} onClick={exitGame}>Leave Room</button>
-        </div>
+        <LobbyView
+          roomCode={roomCode}
+          seat={seat}
+          players={players}
+          onStart={startGame}
+          onLeave={exitGame}
+          isHost={seat === 0}
+          isFull={players.every(p => p !== null)}
+        />
       </div>
     );
   }
 
-  // ===================== GAME VIEW =====================
-  if (view === 'game' && gameState) {
-    const myHand = gameState.your_hand || [];
-    const legalMask = gameState.turn === seat && !paused && !handComplete
-      ? myHand.map(() => true) // server validates
-      : myHand.map(() => false);
-    const needsReveal = gameState.turn === seat && !paused && !handComplete && gameState.phase === 'phase1' && !gameState.trump_suit && gameState.trick.length > 0;
-    const seatPositions = ['bottom','left','top','right'];
-    const allPlayers = gameState.players || players;
-    const handCount = myHand.length;
-    const overlap = handCount > 6 ? -(Math.min(28, (handCount-6)*4)) : 0;
-
+  if (view === 'game') {
     return (
       <div className="app">
-        <div className="game-view">
-          <button className="exit-btn" onClick={() => setConfirmExit(true)}>×</button>
-          <div className="trick-counter">Trick {Math.min(gameState.trick_number || 1, 13)} / 13</div>
-
-          <div className="score-cluster">
-            <div className="score-side">
-              <span className="score-label">Team A</span>
-              <span className="score-number score-team-a">{gameState.scores?.A || 0}</span>
-              <div className="mendi-strip">
-                {(gameState.mendi?.A || []).map((c,i) => (
-                  <div key={i} className="mendi-mini" style={{color: SUIT_COLORS[c.suit]==='red'?'#c41e3a':'#1a1a1a'}}>{c.suit}</div>
-                ))}
-              </div>
-            </div>
-            <div className="trump-slot">
-              <span className="trump-label">Trump</span>
-              {gameState.trump_suit ? (
-                <div className="trump-card-mini" style={{color: SUIT_COLORS[gameState.trump_suit]==='red'?'#c41e3a':'#1a1a1a'}}>{gameState.trump_suit}</div>
-              ) : (
-                <div className="trump-unknown">?</div>
-              )}
-            </div>
-            <div className="score-side">
-              <span className="score-label">Team B</span>
-              <span className="score-number score-team-b">{gameState.scores?.B || 0}</span>
-              <div className="mendi-strip">
-                {(gameState.mendi?.B || []).map((c,i) => (
-                  <div key={i} className="mendi-mini" style={{color: SUIT_COLORS[c.suit]==='red'?'#c41e3a':'#1a1a1a'}}>{c.suit}</div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="table-felt">
-            <div className="felt-ellipse" />
-            {[2,1,3,0].map(s => {
-              const pos = seatPositions[s];
-              const isActive = gameState.turn === s && !paused && !handComplete;
-              const isDealer = gameState.dealer === s;
-              const pl = allPlayers[s];
-              return (
-                <div key={s} className={`seat-marker ${pos} ${isActive ? 'active' : ''}`}>
-                  <div style={{position:'relative'}}>
-                    <div className="seat-avatar">{s === seat ? '👤' : '🤖'}</div>
-                    {isDealer && <div className="dealer-chip" style={{top:-4,right:-4}}>D</div>}
-                  </div>
-                  <div className="seat-name-tag" style={{color: pl?.team==='A'?'#6bb5ff':'#ff8a8a'}}>
-                    {pl ? pl.name : 'Open'}
-                  </div>
-                  {s !== seat && pl?.is_bot && <div className="bot-badge">BOT</div>}
-                </div>
-              );
-            })}
-
-            <div className="trick-center">
-              {trick.map((t, i) => {
-                const pos = (t.seat + 4 - seat) % 4;
-                return (
-                  <div key={`${t.card.id}-${i}`} className={`trick-card-wrapper pos-${pos}`}>
-                    <Card card={t.card} />
-                    {t.is_reveal && <div style={{position:'absolute',top:-20,left:'50%',transform:'translateX(-50%)',background:'var(--accent-gold)',color:'#1a1a1a',padding:'2px 8px',borderRadius:'10px',fontSize:'0.65rem',fontWeight:'800',whiteSpace:'nowrap'}}>TRUMP!</div>}
-                  </div>
-                );
-              })}
-            </div>
-
-            {paused && <div className="pause-indicator">Collecting trick...</div>}
-          </div>
-
-          {needsReveal && (
-            <button className="reveal-btn" onClick={revealTrump}>
-              Reveal Trump (lowest card)
-            </button>
-          )}
-
-          <div className="hand-strip">
-            {myHand.map((card, i) => (
-              <div key={card.id} className="hand-card-wrapper" style={{marginLeft: i>0 ? `${overlap}px` : 0, zIndex: i}}>
-                <Card
-                  card={card}
-                  disabled={!legalMask[i] || paused || handComplete}
-                  onClick={() => playCard(card.id)}
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {showTrumpFlash && <TrumpFlash suit={flashSuit} onDone={() => setShowTrumpFlash(false)} />}
-        {handComplete && (
-          <ResultOverlay
-            result={result}
-            scores={gameState.scores || {A:0,B:0}}
-            mendi={gameState.mendi || {A:[],B:[]}}
-            onRematch={rematch}
-            onExit={exitGame}
-          />
-        )}
-        {confirmExit && <ConfirmExit onConfirm={exitGame} onCancel={() => setConfirmExit(false)} />}
-        <ToastContainer toasts={toasts} />
+        <GameView
+          gameState={gameState}
+          trick={trick}
+          seat={seat}
+          onPlayCard={playCard}
+          onRevealTrump={revealTrump}
+          onRematch={rematch}
+          onExit={exitGame}
+          showTrumpFlash={showTrumpFlash}
+          flashSuit={flashSuit}
+          onTrumpDone={() => setShowTrumpFlash(false)}
+          paused={paused}
+          handComplete={handComplete}
+          result={result}
+          toasts={toasts}
+          confirmExit={confirmExit}
+          onConfirmExit={() => setConfirmExit(true)}
+          onCancelExit={() => setConfirmExit(false)}
+        />
       </div>
     );
   }
