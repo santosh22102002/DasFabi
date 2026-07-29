@@ -1213,8 +1213,8 @@ function TrumpFlash({ suit, onDone }) {
     <div className="trump-flash-overlay">
       <div className="trump-flash-content">
         <div className="trump-flash-suit" style={{ color }}>{suit}</div>
-        <div className="trump-flash-text">TRUMP REVEALED!</div>
-        <div className="trump-flash-sub">{suit} is now trump</div>
+        <div className="trump-flash-text">REVEALED!</div>
+        <div className="trump-flash-sub">{suit}</div>
       </div>
     </div>
   );
@@ -1280,10 +1280,10 @@ function ConfirmExit({ onConfirm, onCancel }) {
 function MenuView({ onSolo, onHub }) {
   return (
     <div className="view">
-      <div className="menu-title">MENDIKOT</div>
-      <div className="menu-sub">The Classic Indian Card Game</div>
-      <button className="menu-btn primary" onClick={onSolo}>Solo vs Bots</button>
-      <button className="menu-btn secondary" onClick={onHub}>Play with Friends</button>
+      <div className="menu-title">ꯗ꯭ꯁ ꯐꯥꯕꯤ</div>
+      <div className="menu-sub">Nongmagi Sanahoudaba Yade</div>
+      <button className="menu-btn primary" onClick={onSolo}>Solo</button>
+      <button className="menu-btn secondary" onClick={onHub}>Play with Friend</button>
     </div>
   );
 }
@@ -1296,7 +1296,7 @@ function HubView({ playerName, onBack, onCreate, onJoin, errorMsg }) {
   return (
     <div className="view">
       <div className="form-card">
-        <div className="form-title">Play with Friends</div>
+        <div className="form-title">Play with Friend</div>
         <div style={{display:'flex',gap:8,marginBottom:16}}>
           <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='create'?1:0.5}} onClick={()=>setMode('create')}>Create</button>
           <button className="menu-btn secondary" style={{flex:1,margin:0,fontSize:'0.9rem',opacity:mode==='join'?1:0.5}} onClick={()=>setMode('join')}>Join</button>
@@ -1459,9 +1459,9 @@ function GameView({ gameState, trick, seat, onPlayCard, onRevealTrump, onRematch
                 } : {}}
               >
                 <Card card={t.card} />
-                {t.is_reveal && <div style={{position:'absolute',top:-20,left:'50%',transform:'translateX(-50%)',background:'var(--accent-gold)',color:'#1a1a1a',padding:'2px 8px',borderRadius:'10px',fontSize:'0.65rem',fontWeight:'800',whiteSpace:'nowrap'}}>TRUMP!</div>}
+                {t.is_reveal && <div style={{position:'absolute',top:-20,left:'50%',transform:'translateX(-50%)',background:'var(--accent-gold)',color:'#1a1a1a',padding:'2px 8px',borderRadius:'10px',fontSize:'0.65rem',fontWeight:'800',whiteSpace:'nowrap'}}>REVEALED!</div>}
               </div>
-            );
+            );    
           })}
         </div>
 
@@ -1470,7 +1470,7 @@ function GameView({ gameState, trick, seat, onPlayCard, onRevealTrump, onRematch
 
       {mustReveal && (
         <button className="reveal-btn" onClick={onRevealTrump}>
-          Reveal Trump
+          Reveal
         </button>
       )}
 
