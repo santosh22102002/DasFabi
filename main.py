@@ -1,2642 +1,1270 @@
+"""
+Mendikot — single-file web game.
+Backend (FastAPI + WebSocket) + game engine + embedded React frontend (no Babel).
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+Run:
+    pip install fastapi uvicorn
+    python main.py
+Open http://localhost:8000
+"""
+
 import asyncio
 import json
 import random
-import uuid
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Set, Tuple, Any
-from enum import Enum
+import string
 import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Optional
 
-# ============== GAME CONSTANTS ==============
-SUITS = ['♠', '♥', '♦', '♣']
-SUIT_COLORS = {'♠': '#2d2d2d', '♣': '#2d2d2d', '♥': '#d32f2f', '♦': '#d32f2f'}
-SUIT_NAMES = {'♠': 'spades', '♥': 'hearts', '♦': 'diamonds', '♣': 'clubs'}
-RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-RANK_VALUES = {r: i for i, r in enumerate(RANKS)}
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-TEAM_A = {0, 2}
-TEAM_B = {1, 3}
+# ================================================================ constants
 
-def get_team(seat: int) -> str:
-    return 'A' if seat in TEAM_A else 'B'
+SUITS = ["S", "H", "D", "C"]
+RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+RANK_VALUE = {r: i for i, r in enumerate(RANKS)}
 
-def other_team(team: str) -> str:
-    return 'B' if team == 'A' else 'A'
+PHASE1_TRICKS = 5          # tricks played from the initial 5-card deal
+TOTAL_TRICKS = 13
+TRICK_PAUSE = 3.0          # seconds a finished trick stays on the table
+BOT_DELAY = (0.6, 1.4)     # bot "thinking" window (seconds)
+RECONNECT_GRACE = 15.0     # wait this long for a rejoin before cancelling
+ROOM_TTL = 600             # GC: remove rooms inactive for 10 minutes
+GC_INTERVAL = 60
+BOT_NAMES = {1: "West Bot", 2: "North Bot", 3: "East Bot"}
 
-# ============== DATA CLASSES ==============
+
+def team_of(seat): return "A" if seat % 2 == 0 else "B"
+def new_deck(): return [r + s for s in SUITS for r in RANKS]
+def card_suit(c): return c[-1]
+def card_rank(c): return c[:-1]
+def rank_value(c): return RANK_VALUE[c[:-1]]
+def is_mendi(c): return c[:-1] == "10"
+def sort_key(c): return (SUITS.index(c[-1]), RANK_VALUE[c[:-1]])
+
+
+def clean_name(s):
+    s = (s or "").strip()[:18]
+    return s or "Player"
+
+
+def new_id():
+    return uuid.uuid4().hex
+
+
+# ================================================================ game engine
+
 @dataclass
-class Card:
-    suit: str
-    rank: str
+class MendikotHand:
+    dealer: int
+    hands: dict                      # seat -> [card, ...]
+    boot: list                       # undealt 32 cards
+    leader: int                      # seat that leads the current trick
+    boot_dealt: bool = False
+    trump: Optional[str] = None
+    trump_card: Optional[str] = None
+    trick: list = field(default_factory=list)        # [(seat, card)] in play order
+    last_trick: list = field(default_factory=list)   # shown during the pause
+    last_trick_winner: Optional[int] = None
+    trick_num: int = 1
+    turn: Optional[int] = None
+    paused: bool = False
+    complete: bool = False
+    winner: Optional[str] = None     # 'A' | 'B' | None (draw)
+    mendi: dict = field(default_factory=lambda: {"A": [], "B": []})   # suits of won 10s
+    team_cards: dict = field(default_factory=lambda: {"A": 0, "B": 0})
+    exempt: set = field(default_factory=set)         # mid-trick follow-suit exemption
+    pending_boot: bool = False
 
-    def to_dict(self):
-        return {
-            'suit': self.suit,
-            'rank': self.rank,
-            'value': RANK_VALUES[self.rank],
-            'is_ten': self.rank == '10',
-            'color': SUIT_COLORS[self.suit]
-        }
+    @classmethod
+    def new_hand(cls, dealer):
+        deck = new_deck()
+        random.shuffle(deck)
+        order = [(dealer + 1 + i) % 4 for i in range(4)]
+        hands = {s: [] for s in range(4)}
+        for _ in range(5):
+            for s in order:
+                hands[s].append(deck.pop())
+        for s in range(4):
+            hands[s].sort(key=sort_key)
+        leader = (dealer + 1) % 4
+        return cls(dealer=dealer, hands=hands, boot=deck, leader=leader, turn=leader)
 
-    def __hash__(self):
-        return hash((self.suit, self.rank))
+    # ---- legality ----------------------------------------------------------
 
-    def __eq__(self, other):
-        if isinstance(other, Card):
-            return self.suit == other.suit and self.rank == other.rank
-        return False
+    def must_reveal(self, seat):
+        """True if `seat` is void in the led suit during phase 1 and must reveal trump."""
+        if self.complete or self.paused or self.turn != seat or not self.trick:
+            return False
+        if self.trump is not None or self.boot_dealt or seat in self.exempt:
+            return False
+        led = card_suit(self.trick[0][1])
+        return all(card_suit(c) != led for c in self.hands[seat])
+
+    def legal_cards(self, seat):
+        if self.complete or self.paused or self.turn != seat:
+            return []
+        hand = self.hands[seat]
+        if not self.trick or seat in self.exempt:
+            return list(hand)
+        led = card_suit(self.trick[0][1])
+        follows = [c for c in hand if card_suit(c) == led]
+        return follows if follows else list(hand)   # void: reveal candidates or any card
+
+    # ---- actions -----------------------------------------------------------
+
+    def play(self, seat, card, as_reveal=False):
+        self.hands[seat].remove(card)
+        if not self.trick:                          # first play of a new trick
+            self.last_trick = []
+            self.last_trick_winner = None
+        self.trick.append((seat, card))
+        if as_reveal:
+            self.trump = card_suit(card)
+            self.trump_card = card
+            led = card_suit(self.trick[0][1])
+            played = {s for s, _ in self.trick}
+            for s in range(4):                      # mid-trick exemption (defensive)
+                if s not in played and all(card_suit(c) != led for c in self.hands[s]):
+                    self.exempt.add(s)
+        if len(self.trick) == 4:
+            self.paused = True
+            self.turn = None
+        else:
+            self.turn = (seat + 1) % 4
+
+    def resolve_trick(self):
+        led = card_suit(self.trick[0][1])
+        trump = self.trump
+
+        def power(sc):
+            c = sc[1]
+            if trump and card_suit(c) == trump:
+                return (2, rank_value(c))
+            if card_suit(c) == led:
+                return (1, rank_value(c))
+            return (0, rank_value(c))
+
+        wseat, _ = max(self.trick, key=power)
+        team = team_of(wseat)
+        self.team_cards[team] += 4
+        gained = [card_suit(c) for _, c in self.trick if is_mendi(c)]
+        self.mendi[team].extend(gained)
+        self.last_trick = list(self.trick)
+        self.last_trick_winner = wseat
+        self.trick = []
+        self.exempt.clear()
+        self.pending_boot = (not self.boot_dealt) and (
+            self.trump is not None or self.trick_num >= PHASE1_TRICKS)
+        if self.trick_num >= TOTAL_TRICKS:
+            self.complete = True
+            a, b = len(self.mendi["A"]), len(self.mendi["B"])
+            self.winner = "A" if a > b else ("B" if b > a else None)
+            self.turn = None
+        else:
+            self.trick_num += 1
+            self.leader = wseat
+            self.turn = wseat
+        return wseat, team, gained
+
+    def deal_boot(self):
+        self.boot_dealt = True
+        self.pending_boot = False
+        order = [(self.dealer + 1 + i) % 4 for i in range(4)]
+        for s in order:
+            self.hands[s].extend(self.boot[:8])
+            del self.boot[:8]
+            self.hands[s].sort(key=sort_key)
+
+    # ---- bots ---------------------------------------------------------------
+
+    def bot_choose(self, seat):
+        """Lowest legal card; if forced to reveal, lowest card overall."""
+        if self.must_reveal(seat):
+            return min(self.hands[seat], key=rank_value), True
+        return min(self.legal_cards(seat), key=rank_value), False
+
+
+# ================================================================ rooms
 
 @dataclass
 class Player:
-    seat: int
+    pid: str
     name: str
+    seat: int
     is_bot: bool = False
-    hand: List[Card] = field(default_factory=list)
-    connection_id: Optional[str] = None
-    team: str = field(init=False)
-
-    def __post_init__(self):
-        self.team = get_team(self.seat)
-
-    def to_dict(self, hide_hand=False):
-        return {
-            'seat': self.seat,
-            'name': self.name,
-            'is_bot': self.is_bot,
-            'team': self.team,
-            'hand_size': len(self.hand),
-            'hand': [c.to_dict() for c in self.hand] if not hide_hand else None
-        }
-
-# ============== GAME ENGINE ==============
-class MendikotGame:
-    def __init__(self, dealer_seat=0):
-        self.dealer_seat = dealer_seat
-        self.leader_seat = (dealer_seat + 1) % 4
-        self.current_seat = self.leader_seat
-        self.trump_suit: Optional[str] = None
-        self.trump_revealed = False
-        self.trump_revealer: Optional[int] = None
-        self.trump_card: Optional[Card] = None
-        self.phase = 1  # 1 = first 5 cards, 2 = after boot
-        self.trick_num = 1
-        self.trick_cards: List[Optional[Card]] = [None, None, None, None]
-        self.trick_leader = self.leader_seat
-        self.led_suit: Optional[str] = None
-        self.boot_dealt = False
-        self.game_over = False
-        self.winner: Optional[str] = None
-        self.mendi: Dict[str, List[Card]] = {'A': [], 'B': []}
-        self.cards_won: Dict[str, int] = {'A': 0, 'B': 0}
-        self.tricks_won: Dict[str, int] = {'A': 0, 'B': 0}
-        self.players: List[Player] = []
-        self.deck: List[Card] = []
-        self.boot: List[Card] = []
-        self.history: List[dict] = []
-        self.void_in_trick: Set[int] = set()  # Players void in led suit when trump revealed mid-trick
-        self.trick_in_progress = False
-        self.trick_complete = False
-        self.trick_winner_seat: Optional[int] = None
-
-    def create_deck(self):
-        self.deck = [Card(s, r) for s in SUITS for r in RANKS]
-        random.shuffle(self.deck)
-
-    def deal_phase1(self):
-        for p in self.players:
-            p.hand = [self.deck.pop() for _ in range(5)]
-            p.hand.sort(key=lambda c: (SUITS.index(c.suit), RANK_VALUES[c.rank]))
-        self.boot = self.deck[:]
-        self.deck = []
-
-    def deal_boot(self):
-        if self.boot_dealt:
-            return
-        for p in self.players:
-            new_cards = [self.boot.pop() for _ in range(8)]
-            p.hand.extend(new_cards)
-            p.hand.sort(key=lambda c: (SUITS.index(c.suit), RANK_VALUES[c.rank]))
-        self.boot_dealt = True
-        self.phase = 2
-
-    def start(self, player_names: List[Tuple[str, bool]]):
-        self.players = [Player(i, name, is_bot) for i, (name, is_bot) in enumerate(player_names)]
-        self.create_deck()
-        self.deal_phase1()
-
-    def get_legal_cards(self, seat: int) -> List[Card]:
-        player = self.players[seat]
-        if not self.led_suit:
-            return player.hand[:]
-
-        has_suit = any(c.suit == self.led_suit for c in player.hand)
-        if has_suit:
-            return [c for c in player.hand if c.suit == self.led_suit]
-
-        # Void in led suit
-        if self.trump_suit is None and self.phase == 1 and seat not in self.void_in_trick:
-            # Must reveal trump - can play any card (the reveal mechanism handles this)
-            return player.hand[:]
-
-        return player.hand[:]
-
-    def can_reveal_trump(self, seat: int) -> bool:
-        if self.trump_suit is not None:
-            return False
-        if self.phase != 1:
-            return False
-        if self.led_suit is None:
-            return False
-        player = self.players[seat]
-        has_led = any(c.suit == self.led_suit for c in player.hand)
-        return not has_led and seat not in self.void_in_trick
-
-    def play_card(self, seat: int, card: Card) -> dict:
-        result = {'success': False, 'message': '', 'events': []}
-
-        if self.game_over:
-            result['message'] = 'Game is over'
-            return result
-
-        if seat != self.current_seat:
-            result['message'] = 'Not your turn'
-            return result
-
-        if self.trick_complete:
-            result['message'] = 'Trick is complete, waiting'
-            return result
-
-        player = self.players[seat]
-        if card not in player.hand:
-            result['message'] = 'Card not in hand'
-            return result
-
-        legal = self.get_legal_cards(seat)
-        if card not in legal:
-            result['message'] = 'Illegal card play'
-            return result
-
-        # Handle trump reveal
-        revealed_now = False
-        if self.can_reveal_trump(seat):
-            self.trump_suit = card.suit
-            self.trump_revealed = True
-            self.trump_revealer = seat
-            self.trump_card = card
-            revealed_now = True
-            self.void_in_trick.add(seat)
-            result['events'].append({
-                'type': 'trump_revealed',
-                'seat': seat,
-                'suit': card.suit,
-                'card': card.to_dict()
-            })
-
-        # Play the card
-        player.hand.remove(card)
-        self.trick_cards[seat] = card
-
-        if self.led_suit is None:
-            self.led_suit = card.suit
-            self.trick_leader = seat
-
-        result['events'].append({
-            'type': 'card_played',
-            'seat': seat,
-            'card': card.to_dict(),
-            'trick_num': self.trick_num,
-            'revealed_now': revealed_now,
-            'current_seat': self.current_seat
-        })
-
-        # Check if trick is complete
-        if all(c is not None for c in self.trick_cards):
-            self._resolve_trick()
-            result['events'].extend(self._get_trick_events())
-        else:
-            self.current_seat = (self.current_seat + 1) % 4
-
-        result['success'] = True
-        return result
-
-    def _resolve_trick(self):
-        self.trick_complete = True
-        self.trick_in_progress = False
-
-        cards = [(seat, card) for seat, card in enumerate(self.trick_cards) if card is not None]
-
-        if self.trump_suit:
-            trump_cards = [(s, c) for s, c in cards if c.suit == self.trump_suit]
-            if trump_cards:
-                winner = max(trump_cards, key=lambda x: RANK_VALUES[x[1].rank])[0]
-            else:
-                suit_cards = [(s, c) for s, c in cards if c.suit == self.led_suit]
-                winner = max(suit_cards, key=lambda x: RANK_VALUES[x[1].rank])[0]
-        else:
-            suit_cards = [(s, c) for s, c in cards if c.suit == self.led_suit]
-            winner = max(suit_cards, key=lambda x: RANK_VALUES[x[1].rank])[0]
-
-        self.trick_winner_seat = winner
-        winning_team = get_team(winner)
-        self.tricks_won[winning_team] += 1
-
-        # Collect mendi (10s)
-        tens = [c for s, c in cards if c.rank == '10']
-        self.mendi[winning_team].extend(tens)
-        self.cards_won[winning_team] += len(cards)
-
-        # Check if boot should be dealt
-        if not self.boot_dealt:
-            if self.trick_num == 5 or self.trump_revealed:
-                self.deal_boot()
-
-        # Check if game over
-        if self.trick_num >= 13:
-            self._end_game()
-
-    def _get_trick_events(self) -> List[dict]:
-        events = [{
-            'type': 'trick_won',
-            'winner_seat': self.trick_winner_seat,
-            'winning_team': get_team(self.trick_winner_seat),
-            'trick_cards': [{**c.to_dict(), 'seat': i} for i, c in enumerate(self.trick_cards) if c],
-            'tens_won': [c.to_dict() for c in self.trick_cards if c and c.rank == '10'],
-            'trick_num': self.trick_num
-        }]
-
-        if self.boot_dealt and self.trick_num <= 5:
-            events.append({'type': 'boot_dealt'})
-
-        if self.game_over:
-            events.append({
-                'type': 'hand_complete',
-                'winner': self.winner,
-                'mendi_A': [c.to_dict() for c in self.mendi['A']],
-                'mendi_B': [c.to_dict() for c in self.mendi['B']],
-                'scores': {
-                    'A': len(self.mendi['A']),
-                    'B': len(self.mendi['B'])
-                }
-            })
-
-        return events
-
-    def next_trick(self):
-        if not self.trick_complete or self.game_over:
-            return False
-
-        self.trick_num += 1
-        self.trick_cards = [None, None, None, None]
-        self.led_suit = None
-        self.current_seat = self.trick_winner_seat
-        self.trick_leader = self.trick_winner_seat
-        self.trick_complete = False
-        self.trick_in_progress = True
-        self.trick_winner_seat = None
-        self.void_in_trick = set()
-        return True
-
-    def _end_game(self):
-        self.game_over = True
-        a_count = len(self.mendi['A'])
-        b_count = len(self.mendi['B'])
-
-        if a_count > b_count:
-            self.winner = 'A'
-        elif b_count > a_count:
-            self.winner = 'B'
-        else:
-            self.winner = 'draw'
-
-    def get_state(self, for_seat: Optional[int] = None) -> dict:
-        return {
-            'dealer_seat': self.dealer_seat,
-            'leader_seat': self.leader_seat,
-            'current_seat': self.current_seat,
-            'trump_suit': self.trump_suit,
-            'trump_revealed': self.trump_revealed,
-            'trump_revealer': self.trump_revealer,
-            'trump_card': self.trump_card.to_dict() if self.trump_card else None,
-            'phase': self.phase,
-            'trick_num': self.trick_num,
-            'trick_cards': [c.to_dict() if c else None for c in self.trick_cards],
-            'trick_leader': self.trick_leader,
-            'led_suit': self.led_suit,
-            'boot_dealt': self.boot_dealt,
-            'game_over': self.game_over,
-            'winner': self.winner,
-            'mendi': {
-                'A': [c.to_dict() for c in self.mendi['A']],
-                'B': [c.to_dict() for c in self.mendi['B']]
-            },
-            'cards_won': self.cards_won,
-            'tricks_won': self.tricks_won,
-            'players': [p.to_dict(hide_hand=for_seat is not None and p.seat != for_seat) for p in self.players],
-            'trick_complete': self.trick_complete,
-            'trick_winner_seat': self.trick_winner_seat,
-            'for_seat': for_seat
-        }
-
-    def bot_choose_card(self, seat: int) -> Optional[Card]:
-        player = self.players[seat]
-        if not player.hand:
-            return None
-
-        legal = self.get_legal_cards(seat)
-        if not legal:
-            return None
-
-        # Bot strategy: play lowest legal card
-        # If forced to reveal trump, reveal lowest card overall
-        if self.can_reveal_trump(seat):
-            return min(player.hand, key=lambda c: (RANK_VALUES[c.rank], SUITS.index(c.suit)))
-
-        return min(legal, key=lambda c: (RANK_VALUES[c.rank], SUITS.index(c.suit)))
+    ws: Optional[WebSocket] = None
+    connected: bool = False
 
 
-# ============== ROOM MANAGEMENT ==============
+@dataclass
 class Room:
-    def __init__(self, code: str, host_id: str, host_name: str, host_team: str):
-        self.code = code
-        self.host_id = host_id
-        self.players: Dict[str, dict] = {}  # connection_id -> {name, seat, team}
-        self.seats: Dict[int, Optional[str]] = {0: None, 1: None, 2: None, 3: None}
-        self.team_counts = {'A': 0, 'B': 0}
-        self.game: Optional[MendikotGame] = None
-        self.started = False
-        self.created_at = time.time()
-        self.last_activity = time.time()
-        self.solo = False
-        self.dealer_rotation = 0
-        self.connections: Dict[str, WebSocket] = {}
-        self.bot_names = ['Raju', 'Vijay', 'Amit']
-
-    def add_player(self, conn_id: str, name: str, team: str) -> Optional[int]:
-        if self.started:
-            return None
-        if self.team_counts[team] >= 2:
-            return None
-        if conn_id in self.players:
-            return self.players[conn_id]['seat']
-
-        # Find seat for team
-        team_seats = TEAM_A if team == 'A' else TEAM_B
-        seat = None
-        for s in team_seats:
-            if self.seats[s] is None:
-                seat = s
-                break
-
-        if seat is None:
-            return None
-
-        self.players[conn_id] = {'name': name, 'seat': seat, 'team': team}
-        self.seats[seat] = conn_id
-        self.team_counts[team] += 1
-        self.last_activity = time.time()
-        return seat
-
-    def remove_player(self, conn_id: str):
-        if conn_id not in self.players:
-            return
-        seat = self.players[conn_id]['seat']
-        team = self.players[conn_id]['team']
-        del self.players[conn_id]
-        self.seats[seat] = None
-        self.team_counts[team] -= 1
-        if conn_id in self.connections:
-            del self.connections[conn_id]
-        self.last_activity = time.time()
-
-    def is_full(self) -> bool:
-        return len(self.players) == 4
-
-    def is_host(self, conn_id: str) -> bool:
-        return conn_id == self.host_id
-
-    def start_game(self):
-        if not self.is_full():
-            return False
-        self.started = True
-        names = []
-        for seat in range(4):
-            conn_id = self.seats[seat]
-            if conn_id:
-                names.append((self.players[conn_id]['name'], False))
-            else:
-                names.append((self.bot_names.pop(0) if self.bot_names else f'Bot {seat}', True))
-
-        self.game = MendikotGame(dealer_seat=self.dealer_rotation % 4)
-        self.game.start(names)
-        self.last_activity = time.time()
-        return True
-
-    def start_solo(self, player_name: str):
-        self.solo = True
-        self.started = True
-        names = [(player_name, False), ('Vijay', True), ('Raju', True), ('Amit', True)]
-        self.game = MendikotGame(dealer_seat=0)
-        self.game.start(names)
-        self.last_activity = time.time()
-        return True
-
-    def get_public_state(self) -> dict:
-        return {
-            'code': self.code,
-            'started': self.started,
-            'solo': self.solo,
-            'players': [
-                {
-                    'seat': s,
-                    'name': self.players[c]['name'] if c else None,
-                    'team': self.players[c]['team'] if c else None,
-                    'connected': c in self.connections if c else False,
-                    'is_bot': False if c else True
-                }
-                for s, c in self.seats.items()
-            ],
-            'team_counts': self.team_counts,
-            'host_id': self.host_id
-        }
+    code: str
+    players: dict = field(default_factory=dict)      # seat -> Player
+    host_seat: int = 0
+    dealer: int = 0
+    started: bool = False
+    solo: bool = False
+    hand: Optional[MendikotHand] = None
+    last_active: float = field(default_factory=time.time)
+    tasks: set = field(default_factory=set)
 
 
 class RoomManager:
     def __init__(self):
-        self.rooms: Dict[str, Room] = {}
-        self.connections: Dict[str, str] = {}  # conn_id -> room_code
+        self.rooms = {}
 
-    def create_room(self, host_id: str, host_name: str, host_team: str) -> Room:
-        code = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=6))
-        while code in self.rooms:
-            code = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=6))
-        room = Room(code, host_id, host_name, host_team)
-        room.add_player(host_id, host_name, host_team)
-        self.rooms[code] = room
+    def get(self, code):
+        if not code:
+            return None
+        return self.rooms.get(str(code).strip().upper())
+
+    def add(self, room):
+        self.rooms[room.code] = room
+
+    def remove(self, code):
+        room = self.rooms.pop(code, None)
+        if room:
+            for t in room.tasks:
+                t.cancel()
         return room
 
-    def get_room(self, code: str) -> Optional[Room]:
-        return self.rooms.get(code)
-
-    def remove_room(self, code: str):
-        if code in self.rooms:
-            room = self.rooms[code]
-            for conn_id in list(room.connections.keys()):
-                if conn_id in self.connections:
-                    del self.connections[conn_id]
-            del self.rooms[code]
-
-    def cleanup(self, ttl=600):
-        now = time.time()
-        to_remove = []
-        for code, room in self.rooms.items():
-            if now - room.last_activity > ttl:
-                to_remove.append(code)
-        for code in to_remove:
-            self.remove_room(code)
+    def new_code(self):
+        while True:
+            code = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+            if code not in self.rooms:
+                return code
 
 
-manager = RoomManager()
+MGR = RoomManager()
 
-# ============== WEBSOCKET PROTOCOL ==============
-async def send(ws: WebSocket, msg: dict):
+
+# ================================================================ payloads
+
+def seat_info(room, s):
+    p = room.players.get(s)
+    return {"seat": s, "name": p.name if p else None, "team": team_of(s),
+            "is_bot": p.is_bot if p else False, "connected": p.connected if p else False}
+
+
+def game_payload(room, seat):
+    hand = room.hand
+    return {
+        "type": "game_state", "seat": seat,
+        "hand": hand.hands[seat],
+        "legal": hand.legal_cards(seat),
+        "must_reveal": hand.must_reveal(seat),
+        "turn": hand.turn,
+        "trick": [{"seat": s, "card": c} for s, c in hand.trick],
+        "last_trick": [{"seat": s, "card": c} for s, c in hand.last_trick],
+        "last_trick_winner": hand.last_trick_winner,
+        "trick_num": hand.trick_num,
+        "trump": hand.trump, "trump_card": hand.trump_card,
+        "boot_dealt": hand.boot_dealt,
+        "mendi": hand.mendi, "team_cards": hand.team_cards,
+        "dealer": hand.dealer, "leader": hand.leader,
+        "paused": hand.paused, "complete": hand.complete, "winner": hand.winner,
+        "seats": [seat_info(room, s) for s in range(4)],
+        "hand_sizes": {s: len(hand.hands[s]) for s in range(4)},
+    }
+
+
+def lobby_payload(room, for_pid=None):
+    you = None
+    for s, p in room.players.items():
+        if p.pid == for_pid:
+            you = {"seat": s, "host": s == room.host_seat}
+    return {"type": "lobby", "code": room.code,
+            "seats": [seat_info(room, s) for s in range(4)],
+            "full": len(room.players) == 4,
+            "host_seat": room.host_seat, "you": you}
+
+
+async def send(ws, obj):
     try:
-        await ws.send_json(msg)
-    except:
+        await ws.send_text(json.dumps(obj))
+    except Exception:
         pass
 
-async def broadcast(room: Room, msg: dict, exclude: Optional[str] = None):
-    for conn_id, ws in list(room.connections.items()):
-        if conn_id != exclude:
-            await send(ws, msg)
 
-async def handle_bot_turns(room: Room):
-    if not room.game or room.game.game_over or room.game.trick_complete:
+async def broadcast(room, obj):
+    text = json.dumps(obj)
+    for p in room.players.values():
+        if not p.is_bot and p.connected and p.ws:
+            try:
+                await p.ws.send_text(text)
+            except Exception:
+                p.connected = False
+
+
+async def broadcast_state(room):
+    for p in room.players.values():
+        if not p.is_bot and p.connected and p.ws:
+            await send(p.ws, game_payload(room, p.seat))
+
+
+async def broadcast_lobby(room):
+    for p in room.players.values():
+        if not p.is_bot and p.connected and p.ws:
+            await send(p.ws, lobby_payload(room, p.pid))
+
+
+# ================================================================ game flow
+
+def schedule_bot(room):
+    hand = room.hand
+    if hand is None or hand.complete or hand.paused or hand.turn is None:
         return
+    p = room.players.get(hand.turn)
+    if p and p.is_bot:
+        t = asyncio.create_task(bot_turn(room))
+        room.tasks.add(t)
 
-    game = room.game
-    seat = game.current_seat
-    player = game.players[seat]
 
-    if not player.is_bot:
+async def bot_turn(room):
+    try:
+        await asyncio.sleep(random.uniform(*BOT_DELAY))
+        hand = room.hand
+        if (room.code not in MGR.rooms or hand is None or room.hand is not hand
+                or hand.complete or hand.paused or hand.turn is None):
+            return
+        seat = hand.turn
+        p = room.players.get(seat)
+        if not p or not p.is_bot:
+            return
+        card, reveal = hand.bot_choose(seat)
+        await do_move(room, seat, card, reveal)
+    except asyncio.CancelledError:
+        pass
+
+
+async def do_move(room, seat, card, reveal):
+    hand = room.hand
+    hand.play(seat, card, as_reveal=reveal)
+    if reveal:
+        await broadcast(room, {"type": "trump_revealed", "seat": seat,
+                               "card": card, "suit": hand.trump})
+    await broadcast(room, {"type": "card_played", "seat": seat, "card": card})
+    if len(hand.trick) == 4:
+        t = asyncio.create_task(trick_end(room))
+        room.tasks.add(t)
+    else:
+        await broadcast_state(room)
+        schedule_bot(room)
+
+
+async def trick_end(room):
+    try:
+        hand = room.hand
+        wseat, team, gained = hand.resolve_trick()
+        await broadcast(room, {"type": "trick_won", "winner": wseat,
+                               "team": team, "mendi": gained})
+        await broadcast_state(room)
+        await asyncio.sleep(TRICK_PAUSE)
+        if room.code not in MGR.rooms or room.hand is not hand:
+            return
+        if hand.complete:
+            await broadcast(room, {"type": "hand_complete", "winner": hand.winner,
+                                   "mendi": hand.mendi, "team_cards": hand.team_cards})
+            await broadcast_state(room)
+            return
+        if hand.pending_boot:
+            hand.deal_boot()
+            await broadcast(room, {"type": "boot_dealt"})
+        hand.paused = False
+        await broadcast_state(room)
+        schedule_bot(room)
+    except asyncio.CancelledError:
+        pass
+
+
+async def start_game(room):
+    room.started = True
+    room.hand = MendikotHand.new_hand(room.dealer)
+    await broadcast(room, {"type": "game_start", "dealer": room.dealer})
+    await broadcast_state(room)
+    schedule_bot(room)
+
+
+async def cancel_room(room, reason):
+    if room.code not in MGR.rooms:
         return
+    await broadcast(room, {"type": "room_cancelled", "reason": reason})
+    MGR.remove(room.code)
 
-    await asyncio.sleep(1.2)
 
-    if not room.game or room.game.game_over or room.game.trick_complete:
+async def grace_cancel(room, pid, name):
+    try:
+        await asyncio.sleep(RECONNECT_GRACE)
+        if room.code not in MGR.rooms:
+            return
+        p = next((p for p in room.players.values() if p.pid == pid), None)
+        if p and not p.connected:
+            await cancel_room(room, name + " disconnected")
+    except asyncio.CancelledError:
+        pass
+
+
+async def handle_disconnect(room, pid):
+    if room.code not in MGR.rooms:
         return
-
-    card = game.bot_choose_card(seat)
-    if card is None:
+    p = next((p for p in room.players.values() if p.pid == pid), None)
+    if not p:
         return
-
-    result = game.play_card(seat, card)
-    if result['success']:
-        for event in result['events']:
-            await broadcast(room, event)
-
-        if game.trick_complete and not game.game_over:
-            await asyncio.sleep(3.0)
-            if room.game and room.game.trick_complete and not room.game.game_over:
-                room.game.next_trick()
-                await broadcast(room, {
-                    'type': 'next_trick',
-                    'state': game.get_state()
-                })
-                await handle_bot_turns(room)
-        elif game.game_over:
-            await broadcast(room, {
-                'type': 'game_over',
-                'state': game.get_state()
-            })
+    p.connected = False
+    p.ws = None
+    room.last_active = time.time()
+    if not room.started:
+        if p.seat == room.host_seat:
+            await cancel_room(room, "Host left")
         else:
-            await handle_bot_turns(room)
+            room.players.pop(p.seat, None)
+            if room.players:
+                await broadcast_lobby(room)
+            else:
+                MGR.remove(room.code)
+    else:
+        await broadcast(room, {"type": "seat_status", "seat": p.seat, "connected": False})
+        if not room.solo:
+            t = asyncio.create_task(grace_cancel(room, pid, p.name))
+            room.tasks.add(t)
 
 
-# ============== FASTAPI APP ==============
-app = FastAPI()
+# ================================================================ server
 
-@app.on_event("startup")
-async def startup():
-    async def gc_loop():
-        while True:
-            await asyncio.sleep(60)
-            manager.cleanup()
-    asyncio.create_task(gc_loop())
+async def gc_loop():
+    while True:
+        await asyncio.sleep(GC_INTERVAL)
+        now = time.time()
+        dead = [c for c, r in MGR.rooms.items() if now - r.last_active > ROOM_TTL]
+        for code in dead:
+            room = MGR.rooms.get(code)
+            if room:
+                await broadcast(room, {"type": "room_cancelled", "reason": "Room expired"})
+                MGR.remove(code)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    task = asyncio.create_task(gc_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
-async def root():
-    return HTMLResponse(content=HTML_FRONTEND)
+async def index():
+    return HTMLResponse(PAGE)
+
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    conn_id = str(uuid.uuid4())
-    room = None
+    room: Optional[Room] = None
+    me: Optional[Player] = None
+
+    async def err(message):
+        await send(ws, {"type": "error", "message": message})
 
     try:
         while True:
-            data = await ws.receive_json()
-            action = data.get('action')
+            try:
+                msg = json.loads(await ws.receive_text())
+            except json.JSONDecodeError:
+                continue
 
-            if action == 'create_room':
-                name = data.get('name', 'Player')
-                team = data.get('team', 'A')
-                room = manager.create_room(conn_id, name, team)
-                room.connections[conn_id] = ws
-                manager.connections[conn_id] = room.code
-                await send(ws, {
-                    'type': 'room_created',
-                    'room_code': room.code,
-                    'seat': room.players[conn_id]['seat'],
-                    'state': room.get_public_state()
-                })
+            if room and room.code not in MGR.rooms:      # room vanished under us
+                room, me = None, None
+            if room:
+                room.last_active = time.time()
+            mtype = msg.get("type")
 
-            elif action == 'join_room':
-                code = data.get('room_code', '').upper().strip()
-                name = data.get('name', 'Player')
-                team = data.get('team', 'A')
-                room = manager.get_room(code)
-                if not room:
-                    await send(ws, {'type': 'error', 'message': 'Room not found'})
+            # ---------------- lobby / room lifecycle ----------------
+            if mtype == "create_room":
+                if room:
+                    continue
+                team = "B" if msg.get("team") == "B" else "A"
+                code = MGR.new_code()
+                rm = Room(code=code)
+                seat = 0 if team == "A" else 1
+                pl = Player(pid=new_id(), name=clean_name(msg.get("name")),
+                            seat=seat, ws=ws, connected=True)
+                rm.players[seat] = pl
+                rm.host_seat = rm.dealer = seat
+                MGR.add(rm)
+                room, me = rm, pl
+                await send(ws, {"type": "joined", "player_id": pl.pid, "code": code,
+                                "seat": seat, "host": True, "solo": False})
+                await send(ws, lobby_payload(rm, pl.pid))
+
+            elif mtype == "join_room":
+                if room:
+                    continue
+                rm = MGR.get(msg.get("code"))
+                if not rm:
+                    await err("Room not found")
+                    continue
+                if rm.started:
+                    await err("That game already started")
+                    continue
+                seats = [1, 3] if msg.get("team") == "B" else [0, 2]
+                seat = next((s for s in seats if s not in rm.players), None)
+                if seat is None:
+                    await err("That team is full")
+                    continue
+                pl = Player(pid=new_id(), name=clean_name(msg.get("name")),
+                            seat=seat, ws=ws, connected=True)
+                rm.players[seat] = pl
+                room, me = rm, pl
+                await send(ws, {"type": "joined", "player_id": pl.pid, "code": rm.code,
+                                "seat": seat, "host": False, "solo": False})
+                await broadcast_lobby(rm)
+
+            elif mtype == "start_solo":
+                if room:
+                    continue
+                code = MGR.new_code()
+                rm = Room(code=code, solo=True)
+                pl = Player(pid=new_id(), name=clean_name(msg.get("name")),
+                            seat=0, ws=ws, connected=True)
+                rm.players[0] = pl
+                for s in (1, 2, 3):
+                    rm.players[s] = Player(pid=new_id(), name=BOT_NAMES[s],
+                                           seat=s, is_bot=True, connected=True)
+                rm.host_seat = rm.dealer = 0
+                MGR.add(rm)
+                room, me = rm, pl
+                await send(ws, {"type": "joined", "player_id": pl.pid, "code": code,
+                                "seat": 0, "host": True, "solo": True})
+                await start_game(rm)
+
+            elif mtype == "rejoin":
+                rm = MGR.get(msg.get("code"))
+                pl = next((p for p in rm.players.values()
+                           if p.pid == msg.get("player_id")), None) if rm else None
+                if not rm or not pl or pl.is_bot:
+                    await send(ws, {"type": "rejoin_failed",
+                                    "message": "Could not rejoin the room"})
+                    continue
+                pl.ws = ws
+                pl.connected = True
+                room, me = rm, pl
+                await broadcast(rm, {"type": "seat_status", "seat": pl.seat, "connected": True})
+                if rm.started and rm.hand:
+                    await send(ws, game_payload(rm, pl.seat))
+                else:
+                    await send(ws, lobby_payload(rm, pl.pid))
+
+            elif mtype == "start_game":
+                if not room or not me:
+                    continue
+                if me.seat != room.host_seat:
+                    await err("Only the host can start the game")
                     continue
                 if room.started:
-                    await send(ws, {'type': 'error', 'message': 'Game already started'})
                     continue
-                if room.team_counts[team] >= 2:
-                    await send(ws, {'type': 'error', 'message': 'Team is full'})
+                if len(room.players) < 4:
+                    await err("Waiting for all 4 seats")
                     continue
-                seat = room.add_player(conn_id, name, team)
-                if seat is None:
-                    await send(ws, {'type': 'error', 'message': 'Could not join room'})
-                    continue
-                room.connections[conn_id] = ws
-                manager.connections[conn_id] = room.code
-                await send(ws, {
-                    'type': 'room_joined',
-                    'room_code': room.code,
-                    'seat': seat,
-                    'state': room.get_public_state()
-                })
-                await broadcast(room, {
-                    'type': 'player_joined',
-                    'state': room.get_public_state()
-                }, exclude=conn_id)
+                await start_game(room)
 
-            elif action == 'start_solo':
-                name = data.get('name', 'Player')
-                room = manager.create_room(conn_id, name, 'A')
-                room.solo = True
-                room.connections[conn_id] = ws
-                manager.connections[conn_id] = room.code
-                room.start_solo(name)
-                await send(ws, {
-                    'type': 'game_started',
-                    'seat': 0,
-                    'state': room.game.get_state(for_seat=0)
-                })
-                await handle_bot_turns(room)
-
-            elif action == 'start_game':
-                if not room or not room.is_host(conn_id):
-                    await send(ws, {'type': 'error', 'message': 'Not authorized'})
+            elif mtype == "leave":
+                if not room or not me:
                     continue
-                if not room.is_full():
-                    await send(ws, {'type': 'error', 'message': 'Room not full'})
-                    continue
-                room.start_game()
-                for cid in room.players:
-                    if cid in room.connections:
-                        seat = room.players[cid]['seat']
-                        await send(room.connections[cid], {
-                            'type': 'game_started',
-                            'seat': seat,
-                            'state': room.game.get_state(for_seat=seat)
-                        })
-                await handle_bot_turns(room)
-
-            elif action == 'play_card':
-                if not room or not room.game:
-                    continue
-                seat = room.players.get(conn_id, {}).get('seat')
-                if seat is None:
-                    continue
-                card_data = data.get('card', {})
-                card = Card(card_data.get('suit'), card_data.get('rank'))
-                result = room.game.play_card(seat, card)
-                if result['success']:
-                    for event in result['events']:
-                        await broadcast(room, event)
-
-                    if room.game.trick_complete and not room.game.game_over:
-                        async def next_trick_delayed():
-                            await asyncio.sleep(3.0)
-                            if room.game and room.game.trick_complete and not room.game.game_over:
-                                room.game.next_trick()
-                                await broadcast(room, {
-                                    'type': 'next_trick',
-                                    'state': room.game.get_state()
-                                })
-                                await handle_bot_turns(room)
-                        asyncio.create_task(next_trick_delayed())
-                    elif room.game.game_over:
-                        await broadcast(room, {
-                            'type': 'game_over',
-                            'state': room.game.get_state()
-                        })
-                    else:
-                        await handle_bot_turns(room)
+                rm, pl = room, me
+                room, me = None, None
+                if rm.solo:
+                    await send(ws, {"type": "room_cancelled", "reason": ""})
+                    MGR.remove(rm.code)
+                elif rm.started:
+                    await cancel_room(rm, pl.name + " left the game")
+                elif pl.seat == rm.host_seat:
+                    await cancel_room(rm, "Host left")
                 else:
-                    await send(ws, {'type': 'error', 'message': result['message']})
-
-            elif action == 'reveal_trump':
-                if not room or not room.game:
-                    continue
-                seat = room.players.get(conn_id, {}).get('seat')
-                if seat is None:
-                    continue
-                card_data = data.get('card', {})
-                card = Card(card_data.get('suit'), card_data.get('rank'))
-                # Reveal trump is just playing a card when void
-                result = room.game.play_card(seat, card)
-                if result['success']:
-                    for event in result['events']:
-                        await broadcast(room, event)
-
-                    if room.game.trick_complete and not room.game.game_over:
-                        async def next_trick_delayed():
-                            await asyncio.sleep(3.0)
-                            if room.game and room.game.trick_complete and not room.game.game_over:
-                                room.game.next_trick()
-                                await broadcast(room, {
-                                    'type': 'next_trick',
-                                    'state': room.game.get_state()
-                                })
-                                await handle_bot_turns(room)
-                        asyncio.create_task(next_trick_delayed())
-                    elif room.game.game_over:
-                        await broadcast(room, {
-                            'type': 'game_over',
-                            'state': room.game.get_state()
-                        })
+                    rm.players.pop(pl.seat, None)
+                    if rm.players:
+                        await broadcast_lobby(rm)
                     else:
-                        await handle_bot_turns(room)
-                else:
-                    await send(ws, {'type': 'error', 'message': result['message']})
+                        MGR.remove(rm.code)
 
-            elif action == 'rematch':
-                if not room or not room.is_host(conn_id):
+            # ---------------- gameplay ----------------
+            elif mtype == "play_card":
+                if not room or not me or not room.hand:
                     continue
-                if not room.game or not room.game.game_over:
+                hand = room.hand
+                if hand.complete or hand.paused or hand.turn != me.seat:
+                    await err("Not your turn")
                     continue
-                room.dealer_rotation += 1
-                names = [(p.name, p.is_bot) for p in room.game.players]
-                room.game = MendikotGame(dealer_seat=room.dealer_rotation % 4)
-                room.game.start(names)
-                for cid in room.players:
-                    if cid in room.connections:
-                        seat = room.players[cid]['seat']
-                        await send(room.connections[cid], {
-                            'type': 'game_started',
-                            'seat': seat,
-                            'state': room.game.get_state(for_seat=seat)
-                        })
-                await handle_bot_turns(room)
+                if hand.must_reveal(me.seat):
+                    await err("You cannot follow suit — reveal a trump card instead")
+                    continue
+                card = msg.get("card")
+                if card not in hand.legal_cards(me.seat):
+                    await err("You must follow the led suit")
+                    continue
+                await do_move(room, me.seat, card, False)
 
-            elif action == 'leave_room':
-                break
+            elif mtype == "reveal_trump":
+                if not room or not me or not room.hand:
+                    continue
+                hand = room.hand
+                if hand.complete or hand.paused or hand.turn != me.seat:
+                    await err("Not your turn")
+                    continue
+                if not hand.must_reveal(me.seat):
+                    await err("You can only reveal trump when you cannot follow suit")
+                    continue
+                card = msg.get("card")
+                if card not in hand.hands[me.seat]:
+                    await err("That card is not in your hand")
+                    continue
+                await do_move(room, me.seat, card, True)
 
-            elif action == 'ping':
-                await send(ws, {'type': 'pong'})
+            elif mtype == "rematch":
+                if not room or not me or not room.started or not room.hand:
+                    continue
+                if me.seat != room.host_seat:
+                    await err("Only the host can start a rematch")
+                    continue
+                if not room.hand.complete:
+                    continue
+                room.dealer = (room.dealer + 1) % 4
+                room.hand = MendikotHand.new_hand(room.dealer)
+                await broadcast(room, {"type": "new_hand", "dealer": room.dealer})
+                await broadcast_state(room)
+                schedule_bot(room)
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        print(f"WS Error: {e}")
+    except Exception:
+        pass
     finally:
-        if room:
-            if room.solo:
-                manager.remove_room(room.code)
-            elif not room.started:
-                if room.is_host(conn_id):
-                    manager.remove_room(room.code)
-                    await broadcast(room, {'type': 'room_cancelled', 'reason': 'Host left'})
-                else:
-                    room.remove_player(conn_id)
-                    if conn_id in manager.connections:
-                        del manager.connections[conn_id]
-                    await broadcast(room, {
-                        'type': 'player_left',
-                        'state': room.get_public_state()
-                    })
-            else:
-                # Game in progress - cancel for everyone
-                if conn_id in room.players:
-                    manager.remove_room(room.code)
-                    await broadcast(room, {'type': 'room_cancelled', 'reason': 'Player disconnected during game'})
-
-        try:
-            await ws.close()
-        except:
-            pass
+        if room and me:
+            await handle_disconnect(room, me.pid)
 
 
+# ================================================================ frontend
+# React 18 UMD only — components are written with React.createElement.
+# No JSX, no Babel, no build step.
 
-HTML_FRONTEND = """<!DOCTYPE html>
+PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#0a3d2a">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Mendikot</title>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-:root {
-  --felt: #0d5c3b;
-  --felt-dark: #0a3d2a;
-  --felt-light: #1a7a52;
-  --gold: #d4af37;
-  --gold-light: #f0d878;
-  --card-bg: #f8f9fa;
-  --card-border: #e0e0e0;
-  --red-suit: #d32f2f;
-  --black-suit: #2d2d2d;
-  --shadow: 0 4px 20px rgba(0,0,0,0.4);
-  --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
-  --accent: #ff6b35;
-  --bot-color: #64b5f6;
-}
-
-html, body, #root {
-  height: 100%;
-  overflow: hidden;
-  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-  background: var(--felt-dark);
-  color: white;
-  touch-action: manipulation;
-  -webkit-tap-highlight-color: transparent;
-}
-
-.view-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  background: radial-gradient(ellipse at center, var(--felt) 0%, var(--felt-dark) 100%);
-  position: relative;
-}
-
-.view-container::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: 
-    radial-gradient(circle at 20% 30%, rgba(255,255,255,0.03) 0%, transparent 50%),
-    radial-gradient(circle at 80% 70%, rgba(255,255,255,0.02) 0%, transparent 50%);
-  pointer-events: none;
-}
-
-.logo {
-  font-size: clamp(2.5rem, 8vw, 4rem);
-  font-weight: 900;
-  color: var(--gold);
-  text-shadow: 0 4px 12px rgba(0,0,0,0.5);
-  letter-spacing: 2px;
-  margin-bottom: 8px;
-  animation: logoPulse 3s ease-in-out infinite;
-}
-
-@keyframes logoPulse {
-  0%, 100% { transform: scale(1); text-shadow: 0 4px 12px rgba(0,0,0,0.5); }
-  50% { transform: scale(1.02); text-shadow: 0 6px 20px rgba(212,175,55,0.3); }
-}
-
-.subtitle {
-  font-size: clamp(0.9rem, 3vw, 1.1rem);
-  color: rgba(255,255,255,0.6);
-  margin-bottom: 40px;
-  text-align: center;
-}
-
-.btn {
-  width: 100%;
-  max-width: 320px;
-  padding: 16px 24px;
-  margin: 8px 0;
-  border: none;
-  border-radius: 16px;
-  font-size: 1.1rem;
-  font-weight: 700;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  position: relative;
-  overflow: hidden;
-}
-
-.btn-primary {
-  background: linear-gradient(135deg, var(--gold) 0%, #b8941f 100%);
-  color: #1a1a1a;
-  box-shadow: 0 4px 15px rgba(212,175,55,0.3);
-}
-
-.btn-primary:hover, .btn-primary:active {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(212,175,55,0.4);
-}
-
-.btn-secondary {
-  background: rgba(255,255,255,0.1);
-  color: white;
-  border: 2px solid rgba(255,255,255,0.2);
-  backdrop-filter: blur(10px);
-}
-
-.btn-secondary:hover, .btn-secondary:active {
-  background: rgba(255,255,255,0.2);
-  border-color: rgba(255,255,255,0.3);
-}
-
-.btn-danger {
-  background: linear-gradient(135deg, #e53935 0%, #c62828 100%);
-  color: white;
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  transform: none !important;
-}
-
-.btn-row {
-  display: flex;
-  gap: 12px;
-  width: 100%;
-  max-width: 320px;
-}
-
-.btn-row .btn { flex: 1; }
-
-.input {
-  width: 100%;
-  max-width: 320px;
-  padding: 14px 18px;
-  margin: 8px 0;
-  border: 2px solid rgba(255,255,255,0.15);
-  border-radius: 14px;
-  background: rgba(0,0,0,0.2);
-  color: white;
-  font-size: 1rem;
-  outline: none;
-  transition: border-color 0.2s;
-}
-
-.input:focus { border-color: var(--gold); }
-.input::placeholder { color: rgba(255,255,255,0.4); }
-
-.form-label {
-  width: 100%;
-  max-width: 320px;
-  text-align: left;
-  font-size: 0.85rem;
-  color: rgba(255,255,255,0.7);
-  margin-top: 12px;
-  margin-bottom: 4px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-}
-
-.team-select {
-  display: flex;
-  gap: 12px;
-  width: 100%;
-  max-width: 320px;
-  margin: 8px 0 16px;
-}
-
-.team-option {
-  flex: 1;
-  padding: 14px;
-  border: 2px solid rgba(255,255,255,0.15);
-  border-radius: 14px;
-  text-align: center;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-weight: 700;
-}
-
-.team-option.selected {
-  border-color: var(--gold);
-  background: rgba(212,175,55,0.15);
-}
-
-.team-a { color: #4fc3f7; }
-.team-b { color: #ff8a65; }
-
-.back-btn {
-  position: absolute;
-  top: 16px;
-  left: 16px;
-  background: rgba(0,0,0,0.3);
-  border: none;
-  color: white;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 1.2rem;
-  z-index: 10;
-}
-
-.lobby-container { width: 100%; max-width: 400px; }
-
-.room-code-display {
-  background: rgba(0,0,0,0.3);
-  padding: 16px;
-  border-radius: 16px;
-  text-align: center;
-  margin-bottom: 24px;
-  border: 2px dashed rgba(255,255,255,0.2);
-}
-
-.room-code-display .code {
-  font-size: 2rem;
-  font-weight: 900;
-  color: var(--gold);
-  letter-spacing: 4px;
-  font-family: monospace;
-}
-
-.seats-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 24px;
-}
-
-.seat-box {
-  padding: 20px;
-  border-radius: 16px;
-  text-align: center;
-  border: 2px solid rgba(255,255,255,0.1);
-  background: rgba(0,0,0,0.2);
-  transition: all 0.3s;
-}
-
-.seat-box.filled {
-  border-color: var(--gold);
-  background: rgba(212,175,55,0.1);
-}
-
-.seat-box .seat-name { font-weight: 700; font-size: 1.1rem; }
-.seat-box .seat-team { font-size: 0.8rem; opacity: 0.7; margin-top: 4px; }
-
-.waiting-text { text-align: center; color: rgba(255,255,255,0.6); font-size: 0.9rem; }
-
-.game-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: radial-gradient(ellipse at center, var(--felt) 0%, var(--felt-dark) 100%);
-  position: relative;
-  overflow: hidden;
-}
-
-.game-container::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: 
-    repeating-linear-gradient(45deg, transparent, transparent 35px, rgba(0,0,0,0.03) 35px, rgba(0,0,0,0.03) 70px);
-  pointer-events: none;
-}
-
-.score-board {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  background: rgba(0,0,0,0.3);
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid rgba(255,255,255,0.1);
-  z-index: 5;
-  min-height: 64px;
-}
-
-.score-team {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  min-width: 70px;
-}
-
-.score-team .team-label {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  opacity: 0.8;
-}
-
-.score-team .mendi-count {
-  font-size: 1.4rem;
-  font-weight: 900;
-  color: var(--gold);
-}
-
-.score-team .card-count { font-size: 0.7rem; opacity: 0.6; }
-
-.trump-area { display: flex; flex-direction: column; align-items: center; }
-
-.trump-card {
-  width: 40px;
-  height: 56px;
-  background: var(--card-bg);
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.4rem;
-  font-weight: 900;
-  box-shadow: var(--shadow-sm);
-  border: 1px solid var(--card-border);
-  transition: all 0.3s ease;
-}
-
-.trump-card.hidden {
-  background: linear-gradient(135deg, #1a5276 0%, #154360 100%);
-  color: var(--gold);
-  font-size: 1.2rem;
-}
-
-.trump-label {
-  font-size: 0.65rem;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin-top: 4px;
-  opacity: 0.8;
-}
-
-.mendi-slots { display: flex; gap: 3px; margin-top: 4px; }
-
-.mendi-slot {
-  width: 18px;
-  height: 24px;
-  border-radius: 3px;
-  border: 1px solid rgba(255,255,255,0.2);
-  background: rgba(0,0,0,0.2);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.6rem;
-  transition: all 0.3s;
-}
-
-.mendi-slot.filled {
-  background: var(--card-bg);
-  border-color: var(--gold);
-  color: var(--red-suit);
-  font-weight: 900;
-  animation: mendiPop 0.4s ease;
-}
-
-@keyframes mendiPop {
-  0% { transform: scale(0) rotate(-10deg); }
-  60% { transform: scale(1.2) rotate(5deg); }
-  100% { transform: scale(1) rotate(0); }
-}
-
-.table-area {
-  flex: 1;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  grid-template-columns: auto 1fr auto;
-  grid-template-areas:
-    ". top ."
-    "left center right"
-    ". bottom .";
-  padding: 8px;
-  gap: 8px;
-  position: relative;
-  min-height: 0;
-}
-
-.table-felt {
-  grid-area: center;
-  background: rgba(0,0,0,0.15);
-  border-radius: 24px;
-  border: 2px solid rgba(255,255,255,0.08);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  min-height: 0;
-  min-width: 0;
-}
-
-.seat-marker {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: rgba(0,0,0,0.3);
-  border: 2px solid rgba(255,255,255,0.1);
-  transition: all 0.3s;
-  min-width: 80px;
-  max-width: 120px;
-}
-
-.seat-marker.active {
-  border-color: var(--gold);
-  background: rgba(212,175,55,0.15);
-  box-shadow: 0 0 15px rgba(212,175,55,0.2);
-  animation: activePulse 2s ease-in-out infinite;
-}
-
-@keyframes activePulse {
-  0%, 100% { box-shadow: 0 0 15px rgba(212,175,55,0.2); }
-  50% { box-shadow: 0 0 25px rgba(212,175,55,0.4); }
-}
-
-.seat-marker.bot { border-color: rgba(100,181,246,0.3); }
-
-.seat-marker .seat-avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--felt-light) 0%, var(--felt) 100%);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1rem;
-  font-weight: 700;
-  margin-bottom: 4px;
-  border: 2px solid rgba(255,255,255,0.2);
-  position: relative;
-}
-
-.seat-marker.bot .seat-avatar {
-  background: linear-gradient(135deg, #1565c0 0%, #0d47a1 100%);
-}
-
-.seat-marker .seat-name {
-  font-size: 0.75rem;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 100%;
-}
-
-.seat-marker .seat-cards { font-size: 0.65rem; opacity: 0.6; margin-top: 2px; }
-
-.dealer-badge {
-  position: absolute;
-  top: -4px;
-  right: -4px;
-  background: var(--gold);
-  color: #000;
-  border-radius: 50%;
-  width: 16px;
-  height: 16px;
-  font-size: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 900;
-  border: 1px solid rgba(0,0,0,0.3);
-}
-
-.seat-top { grid-area: top; justify-self: center; align-self: start; }
-.seat-bottom { grid-area: bottom; justify-self: center; align-self: end; }
-.seat-left { grid-area: left; justify-self: start; align-self: center; }
-.seat-right { grid-area: right; justify-self: end; align-self: center; }
-
-.trick-center-abs {
-  position: relative;
-  width: min(200px, 55vw);
-  height: min(260px, 40vh);
-}
-
-.trick-card-pos {
-  position: absolute;
-  width: 56px;
-  height: 78px;
-  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-.trick-card-pos.pos-0 { bottom: 0; left: 50%; transform: translateX(-50%); }
-.trick-card-pos.pos-1 { top: 50%; right: 0; transform: translateY(-50%); }
-.trick-card-pos.pos-2 { top: 0; left: 50%; transform: translateX(-50%); }
-.trick-card-pos.pos-3 { top: 50%; left: 0; transform: translateY(-50%); }
-
-.card {
-  width: 56px;
-  height: 78px;
-  background: var(--card-bg);
-  border-radius: 8px;
-  border: 1px solid var(--card-border);
-  box-shadow: var(--shadow-sm);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  cursor: pointer;
-  user-select: none;
-  transition: transform 0.2s, box-shadow 0.2s;
-  flex-shrink: 0;
-}
-
-.card:hover:not(.disabled):not(.back) {
-  transform: translateY(-8px) scale(1.05);
-  box-shadow: 0 8px 25px rgba(0,0,0,0.3);
-  z-index: 10;
-}
-
-.card.disabled { opacity: 0.4; cursor: not-allowed; }
-
-.card.back {
-  background: linear-gradient(135deg, #1a5276 0%, #154360 100%);
-  border-color: #1a5276;
-}
-
-.card.back::after {
-  content: '';
-  width: 36px;
-  height: 50px;
-  border: 2px solid rgba(255,255,255,0.15);
-  border-radius: 4px;
-  background: repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,0.05) 4px, rgba(255,255,255,0.05) 8px);
-}
-
-.card-rank { font-size: 1.1rem; font-weight: 900; line-height: 1; }
-.card-suit { font-size: 1.3rem; line-height: 1; margin-top: 2px; }
-.card.red .card-rank, .card.red .card-suit { color: var(--red-suit); }
-.card.black .card-rank, .card.black .card-suit { color: var(--black-suit); }
-
-.card-corner-tl, .card-corner-br {
-  position: absolute;
-  font-size: 0.55rem;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.card-corner-tl { top: 4px; left: 4px; }
-.card-corner-br { bottom: 4px; right: 4px; transform: rotate(180deg); }
-
-@keyframes cardPopIn {
-  0% { transform: scale(0) rotateY(90deg); opacity: 0; }
-  70% { transform: scale(1.1) rotateY(0); opacity: 1; }
-  100% { transform: scale(1) rotateY(0); opacity: 1; }
-}
-
-.card-pop-in { animation: cardPopIn 0.4s ease backwards; }
-
-@keyframes cardPlay {
-  0% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.15) translateY(-20px); opacity: 1; }
-  100% { transform: scale(1); opacity: 1; }
-}
-
-.card-play-anim { animation: cardPlay 0.5s ease; }
-
-@keyframes cardCollect {
-  0% { transform: scale(1) rotate(0); opacity: 1; }
-  100% { transform: scale(0.3) rotate(360deg); opacity: 0; }
-}
-
-.card-collect { animation: cardCollect 0.6s ease forwards; }
-
-@keyframes trumpFlash {
-  0% { opacity: 0; }
-  20% { opacity: 1; }
-  80% { opacity: 1; }
-  100% { opacity: 0; }
-}
-
-.trump-flash-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
-  pointer-events: none;
-  opacity: 0;
-}
-
-.trump-flash-overlay.active { animation: trumpFlash 1.5s ease; }
-
-@keyframes trumpStamp {
-  0% { transform: translate(-50%,-50%) scale(3) rotate(-15deg); opacity: 0; }
-  50% { transform: translate(-50%,-50%) scale(0.9) rotate(-5deg); opacity: 1; }
-  70% { transform: translate(-50%,-50%) scale(1.05) rotate(-5deg); opacity: 1; }
-  100% { transform: translate(-50%,-50%) scale(1) rotate(-5deg); opacity: 1; }
-}
-
-.trump-stamp {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  font-size: 4rem;
-  font-weight: 900;
-  color: var(--gold);
-  text-shadow: 0 4px 20px rgba(0,0,0,0.8);
-  opacity: 0;
-  pointer-events: none;
-  z-index: 20;
-  white-space: nowrap;
-}
-
-.trump-stamp.show { animation: trumpStamp 0.6s ease forwards; }
-
-.hand-strip {
-  display: flex;
-  justify-content: center;
-  align-items: flex-end;
-  padding: 12px 8px 20px;
-  min-height: 110px;
-  background: linear-gradient(to top, rgba(0,0,0,0.4) 0%, transparent 100%);
-  position: relative;
-  z-index: 5;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.hand-strip::-webkit-scrollbar { display: none; }
-
-.hand-card-wrapper {
-  position: relative;
-  transition: margin 0.3s ease;
-  flex-shrink: 0;
-}
-
-.reveal-btn {
-  position: absolute;
-  bottom: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  margin-bottom: 8px;
-  padding: 6px 12px;
-  background: var(--accent);
-  color: white;
-  border: none;
-  border-radius: 20px;
-  font-size: 0.7rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  white-space: nowrap;
-  cursor: pointer;
-  animation: bounce 1s ease infinite;
-  box-shadow: 0 4px 12px rgba(255,107,53,0.4);
-  z-index: 20;
-}
-
-@keyframes bounce {
-  0%, 100% { transform: translateX(-50%) translateY(0); }
-  50% { transform: translateX(-50%) translateY(-4px); }
-}
-
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.85);
-  backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-  animation: fadeIn 0.3s ease;
-}
-
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-.overlay-content {
-  background: linear-gradient(135deg, var(--felt) 0%, var(--felt-dark) 100%);
-  border: 2px solid rgba(255,255,255,0.15);
-  border-radius: 24px;
-  padding: 32px;
-  text-align: center;
-  max-width: 90vw;
-  width: 360px;
-  box-shadow: var(--shadow);
-  animation: slideUp 0.4s ease;
-}
-
-@keyframes slideUp {
-  from { transform: translateY(30px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
-}
-
-.overlay-title {
-  font-size: 1.8rem;
-  font-weight: 900;
-  color: var(--gold);
-  margin-bottom: 16px;
-}
-
-.result-mendi {
-  display: flex;
-  justify-content: center;
-  gap: 24px;
-  margin: 20px 0;
-}
-
-.result-team { text-align: center; }
-
-.result-team .rt-label {
-  font-size: 0.8rem;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin-bottom: 8px;
-}
-
-.result-team .rt-score {
-  font-size: 2.5rem;
-  font-weight: 900;
-  color: var(--gold);
-}
-
-.result-team .rt-mendi-cards {
-  display: flex;
-  gap: 4px;
-  justify-content: center;
-  margin-top: 8px;
-}
-
-.mini-card {
-  width: 24px;
-  height: 34px;
-  background: var(--card-bg);
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.7rem;
-  font-weight: 900;
-  border: 1px solid var(--card-border);
-}
-
-.mini-card.red { color: var(--red-suit); }
-.mini-card.black { color: var(--black-suit); }
-
-.toast-container {
-  position: fixed;
-  top: 80px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 40;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  pointer-events: none;
-}
-
-.toast {
-  background: rgba(0,0,0,0.8);
-  color: white;
-  padding: 10px 20px;
-  border-radius: 12px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  animation: toastIn 0.3s ease, toastOut 0.3s ease 2.7s forwards;
-  border-left: 4px solid var(--gold);
-  backdrop-filter: blur(10px);
-  white-space: nowrap;
-}
-
-@keyframes toastIn {
-  from { transform: translateY(-20px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
-}
-
-@keyframes toastOut {
-  to { transform: translateY(-20px); opacity: 0; }
-}
-
-.trick-counter {
-  position: absolute;
-  top: 8px;
-  right: 12px;
-  font-size: 0.75rem;
-  color: rgba(255,255,255,0.5);
-  font-weight: 600;
-  z-index: 10;
-}
-
-.exit-btn {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: rgba(0,0,0,0.3);
-  border: 1px solid rgba(255,255,255,0.1);
-  color: white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 1.1rem;
-  z-index: 10;
-}
-
-@media (min-width: 768px) {
-  .card { width: 64px; height: 90px; border-radius: 10px; }
-  .card-rank { font-size: 1.3rem; }
-  .card-suit { font-size: 1.5rem; }
-  .trick-card-pos { width: 64px; height: 90px; }
-  .trick-center-abs { width: 280px; height: 340px; }
-  .seat-marker { padding: 12px 16px; min-width: 100px; }
-  .seat-marker .seat-avatar { width: 44px; height: 44px; font-size: 1.2rem; }
-  .hand-strip { min-height: 130px; padding-bottom: 24px; }
-}
-
-@media (max-height: 600px) {
-  .score-board { min-height: 50px; padding: 6px 12px; }
-  .trump-card { width: 32px; height: 44px; font-size: 1rem; }
-  .card { width: 48px; height: 68px; }
-  .hand-strip { min-height: 90px; padding-bottom: 12px; }
-  .table-area { padding: 4px; gap: 4px; }
-}
-
-@media (max-height: 450px) and (orientation: landscape) {
-  .game-container { flex-direction: row; }
-  .score-board {
-    flex-direction: column;
-    width: 70px;
-    min-width: 70px;
-    border-right: 1px solid rgba(255,255,255,0.1);
-    border-bottom: none;
-    padding: 8px 4px;
-  }
-  .table-area {
-    grid-template-rows: 1fr auto 1fr;
-    grid-template-columns: auto 1fr auto;
-    grid-template-areas:
-      "left . right"
-      "left center right"
-      "left . right";
-  }
-  .hand-strip {
-    width: 90px;
-    min-width: 90px;
-    flex-direction: column;
-    align-items: center;
-    padding: 8px 4px;
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-  .hand-card-wrapper { margin-left: 0 !important; margin-top: -30px !important; }
-  .hand-card-wrapper:first-child { margin-top: 0 !important; }
-}
+:root{
+  --bg:#0b2318; --felt1:#2f8f5e; --felt2:#1c6440; --felt3:#124a2d;
+  --panel:#0f3524; --panel2:#123b29; --ink:#f2efe4; --muted:#9fc4ae;
+  --gold:#ffd76a; --gold2:#d9a93f; --red:#c0392b; --black:#20242a;
+  --ta:#6ab7ff; --tb:#ff8a80;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#root{height:100%}
+button{font-family:inherit}
+.app{height:100vh;height:100dvh;max-width:520px;margin:0 auto;display:flex;
+  flex-direction:column;position:relative;overflow:hidden}
+.view{flex:1;display:flex;flex-direction:column;gap:14px;padding:26px 22px;overflow-y:auto}
+.view.center{justify-content:center}
+h1,h2,h3{margin:0}
+.logo{text-align:center;margin-bottom:8vh}
+.logo h1{font-size:42px;letter-spacing:8px;color:var(--gold);font-weight:800}
+.tagline{color:var(--muted);margin:8px 0 0}
+.btn{display:flex;flex-direction:column;align-items:center;gap:2px;width:100%;
+  padding:14px;border-radius:14px;border:0;font-size:17px;font-weight:700;cursor:pointer}
+.btn.big{padding:18px 14px}
+.btn.gold{background:linear-gradient(180deg,#f5d67f,var(--gold2));color:#3c2d07}
+.btn.green{background:#2c8a5c;color:#fff}
+.btn.ghost{background:transparent;border:1px solid #ffffff3d;color:var(--ink);font-weight:600}
+.btn:disabled{opacity:.45}
+.btn-sub{font-size:12px;font-weight:500;opacity:.75}
+.fld{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
+input{width:100%;padding:13px;border-radius:12px;border:1px solid #ffffff2e;
+  background:#ffffff12;color:#fff;font-size:16px;outline:none}
+input:focus{border-color:var(--gold)}
+.team-pick{display:flex;gap:10px}
+.team-btn{flex:1;padding:14px 8px;border-radius:14px;border:2px solid #ffffff2e;
+  background:#ffffff0d;color:var(--ink);font-size:16px;font-weight:700;cursor:pointer;
+  display:flex;flex-direction:column;gap:2px;align-items:center}
+.team-btn.sel.ta{border-color:var(--ta);background:#6ab7ff22}
+.team-btn.sel.tb{border-color:var(--tb);background:#ff8a8022}
+.muted{color:var(--muted)} .small{font-size:13px} .center-text{text-align:center}
+.room-code{color:var(--gold);letter-spacing:4px;font-weight:800}
+.chip{display:inline-block;background:#ffffff22;border-radius:8px;padding:1px 7px;
+  font-size:10px;margin-left:6px;vertical-align:middle;letter-spacing:1px}
+.lobby-teams{display:flex;gap:12px}
+.lobby-team{flex:1;background:#ffffff0d;border-radius:16px;padding:10px}
+.lt-title{font-weight:700;font-size:13px;letter-spacing:1px;margin-bottom:4px}
+.lobby-team.ta .lt-title{color:var(--ta)} .lobby-team.tb .lt-title{color:var(--tb)}
+.lobby-seat{background:#ffffff12;border-radius:12px;padding:10px;margin-top:8px;min-height:54px}
+.lobby-seat.open{border:1px dashed #ffffff3d;background:transparent}
+.ls-name{font-weight:600;font-size:14px}
+.ls-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.game{flex:1;display:flex;flex-direction:column;min-height:0}
+.game-top{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;
+  padding:8px 10px 2px;gap:8px}
+.icon-btn{background:#ffffff14;border:0;color:var(--ink);border-radius:10px;
+  width:34px;height:34px;font-size:15px;cursor:pointer}
+.status-line{flex:1;text-align:center;font-size:13px;color:#ffe9b3;min-height:16px}
+.score-cluster{flex:0 0 auto;display:flex;gap:8px;padding:6px 10px;align-items:stretch}
+.team-panel{flex:1;background:var(--panel);border-radius:12px;padding:6px 8px;
+  display:flex;flex-direction:column;gap:4px}
+.team-panel.ta{box-shadow:inset 0 3px 0 var(--ta)}
+.team-panel.tb{box-shadow:inset 0 3px 0 var(--tb)}
+.team-name{font-size:11px;font-weight:700;letter-spacing:1px;color:var(--muted)}
+.card-count{font-size:11px;color:var(--muted)}
+.ten-slots{display:flex;gap:4px}
+.ten-slot{width:24px;height:34px;border-radius:5px;border:1px dashed #ffffff4d;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}
+.ten-slot.filled{background:#faf8ef;border:1px solid #00000055;
+  animation:mendi-spring .55s cubic-bezier(.2,1.8,.4,1)}
+.ten-rank{font-size:11px;font-weight:800} .ten-suit{font-size:11px}
+.red{color:var(--red)} .blk{color:var(--black)}
+.trump-box{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:3px}
+.trump-label{font-size:10px;letter-spacing:2px;color:var(--gold);font-weight:700}
+.mini-card{width:42px;height:60px;font-size:16px}
+.felt{flex:1;position:relative;margin:6px 10px;min-height:130px;
+  background:radial-gradient(ellipse at 50% 42%,var(--felt1) 0%,var(--felt2) 58%,var(--felt3) 100%);
+  border-radius:34px 48px 40px 52px;box-shadow:inset 0 0 46px #00000066}
+.seat-marker{position:absolute;display:flex;flex-direction:column;align-items:center;gap:1px;
+  background:#0f3524e0;padding:6px 10px;border-radius:12px;min-width:86px;transition:opacity .3s}
+.pos-left{left:8px;top:50%;transform:translateY(-50%)}
+.pos-top{top:10px;left:50%;transform:translateX(-50%)}
+.pos-right{right:8px;top:50%;transform:translateY(-50%)}
+.sm-name{font-size:12px;font-weight:700;max-width:110px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.sm-sub{font-size:10px;color:var(--muted)}
+.seat-marker.active{box-shadow:0 0 0 2px var(--gold);animation:pulse 1.3s ease-in-out infinite}
+.seat-marker.off{opacity:.4}
+@keyframes pulse{50%{box-shadow:0 0 0 2px var(--gold),0 0 16px #ffd76a99}}
+.trick-center{position:absolute;inset:0}
+.tc-pos{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+.tc-self{transform:translate(-50%,-50%) translateY(32px)}
+.tc-top{transform:translate(-50%,-50%) translateY(-32px)}
+.tc-left{transform:translate(-50%,-50%) translateX(-44px)}
+.tc-right{transform:translate(-50%,-50%) translateX(44px)}
+.card{position:relative;background:#faf8ef;border-radius:8px;box-shadow:0 2px 6px #00000070;
+  display:flex;align-items:center;justify-content:center;flex:0 0 auto;user-select:none}
+.c-corner{position:absolute;top:3px;left:4px;font-weight:800;line-height:1;
+  font-size:.62em;text-align:center}
+.c-pip{font-size:1.45em;transform:translateY(6%)}
+.card.back{background:linear-gradient(135deg,#27608f,#153a5c);color:#fff;border:2px solid #ffffff33}
+.card.pop{animation:card-in .26s ease-out}
+.card.dim{opacity:.5}
+.card.glow{box-shadow:0 0 0 3px var(--gold),0 3px 12px #000000aa}
+.card.legal{cursor:pointer}
+.card.legal:hover{transform:translateY(-4px)}
+.card.idle{filter:saturate(.5) brightness(.75)}
+@keyframes card-in{from{transform:translateY(18px) scale(.75);opacity:0}}
+.hand-area{flex:0 0 auto;padding:2px 8px 12px}
+.reveal-bar{display:flex;justify-content:center;padding:4px 0 6px}
+.reveal-hint{font-size:13px;color:#ffe9b3;text-align:center}
+.hand-strip{display:flex;justify-content:center;align-items:flex-end;min-height:70px}
+.hcard-wrap{transition:transform .15s}
+.hcard-wrap.sel{transform:translateY(-16px)}
+.hcard-wrap.sel .card{box-shadow:0 0 0 3px var(--gold),0 6px 14px #000000aa}
+.overlay{position:absolute;inset:0;background:#000000a8;display:flex;align-items:center;
+  justify-content:center;z-index:40;padding:22px}
+.panel{background:var(--panel2);border:1px solid #ffffff24;border-radius:18px;padding:22px;
+  width:100%;max-width:340px;display:flex;flex-direction:column;gap:12px;text-align:center}
+.result-rows{display:flex;flex-direction:column;gap:4px;font-size:14px}
+.trump-flash{position:absolute;inset:0;z-index:60;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:6px;
+  background:radial-gradient(circle at 50% 50%,#ffffff30,#000000cc);
+  animation:tf-fade 1.15s ease-out forwards;pointer-events:none}
+.tf-glyph{font-size:112px;line-height:1;animation:tf-pop .5s cubic-bezier(.2,1.7,.4,1)}
+.tf-glyph.red{color:#ff6b5e} .tf-glyph.blk{color:#e8e8f0}
+.tf-label{font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px}
+@keyframes tf-fade{0%{opacity:0}12%{opacity:1}72%{opacity:1}100%{opacity:0}}
+@keyframes tf-pop{from{transform:scale(.25) rotate(-14deg)}}
+@keyframes mendi-spring{0%{transform:scale(.2)}60%{transform:scale(1.2)}100%{transform:scale(1)}}
+.toast{position:absolute;bottom:118px;left:50%;transform:translateX(-50%);
+  background:#000000d0;padding:9px 16px;border-radius:20px;z-index:70;font-size:13.5px;
+  white-space:nowrap;animation:card-in .18s ease-out}
+.reconnect-banner{position:absolute;top:0;left:0;right:0;background:#a35c00;
+  text-align:center;padding:4px 8px;z-index:80;font-size:12.5px}
 </style>
 </head>
 <body>
 <div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
 <script>
+(function () {
+  "use strict";
+  var e = React.createElement;
+  var FR = React.Fragment;
+  var useState = React.useState, useEffect = React useEffect, useRef = React.useRef;
 
-const { useState, useEffect, useRef, useCallback } = React;
-
-const SUITS = ["♠","♥","♦","♣"];
-const SUIT_COLORS = {"♠":"black","♥":"red","♦":"red","♣":"black"};
-const SUIT_BG_COLORS = {"♠":"#1a5276","♥":"#922b21","♦":"#922b21","♣":"#1a5276"};
-const TEAM_COLORS = {"A":"#4fc3f7","B":"#ff8a65"};
-
-function getPos(seat, mySeat) { return (seat - mySeat + 4) % 4; }
-
-function CardEl(props) {
-  const card = props.card;
-  const onClick = props.onClick;
-  const disabled = props.disabled;
-  const hidden = props.hidden;
-  const style = props.style || {};
-  const className = props.className || "";
-  const index = props.index;
-
-  if (hidden) {
-    return React.createElement("div", {
-      className: "card back " + className,
-      style: style
-    });
-  }
-  const color = SUIT_COLORS[card.suit] || "black";
-  const delay = index !== undefined ? index * 0.05 + "s" : "0s";
-  const finalStyle = Object.assign({}, style, { animationDelay: delay });
-
-  return React.createElement("div", {
-    className: "card " + color + " " + (disabled ? "disabled " : " ") + className,
-    style: finalStyle,
-    onClick: disabled ? undefined : onClick
-  }, [
-    React.createElement("span", { key: "tl", className: "card-corner-tl" }, card.rank),
-    React.createElement("span", { key: "r", className: "card-rank" }, card.rank),
-    React.createElement("span", { key: "s", className: "card-suit" }, card.suit),
-    React.createElement("span", { key: "br", className: "card-corner-br" }, card.rank)
-  ]);
-}
-
-function ScoreBoard(props) {
-  const gameState = props.gameState;
-  if (!gameState) return null;
-
-  const aMendi = (gameState.mendi && gameState.mendi.A) || [];
-  const bMendi = (gameState.mendi && gameState.mendi.B) || [];
-  const aCards = gameState.cards_won ? gameState.cards_won.A : 0;
-  const bCards = gameState.cards_won ? gameState.cards_won.B : 0;
-  const trumpSuit = gameState.trump_suit;
-  const trumpRevealed = gameState.trump_revealed;
-
-  const mendiSlots = function(mendiList) {
-    return ["♠","♥","♦","♣"].map(function(s) {
-      const hasIt = mendiList.some(function(c) { return c.suit === s; });
-      return React.createElement("div", {
-        key: s,
-        className: "mendi-slot " + (hasIt ? "filled" : "")
-      }, hasIt ? "10" : "");
-    });
+  var SUIT_GLYPH = { S: "\\u2660", H: "\\u2665", D: "\\u2666", C: "\\u2663" };
+  var SUIT_NAME = { S: "Spades", H: "Hearts", D: "Diamonds", C: "Clubs" };
+  var isRed = function (s) { return s === "H" || s === "D"; };
+  var cardLabel = function (c) { return c.slice(0, -1) + SUIT_GLYPH[c.slice(-1)]; };
+  var seatName = function (gs, seat) {
+    var p = gs.seats.find(function (x) { return x.seat === seat; });
+    return p && p.name ? p.name : "?";
   };
 
-  return React.createElement("div", { className: "score-board" }, [
-    React.createElement("div", { key: "ta", className: "score-team" }, [
-      React.createElement("span", { key: "l", className: "team-label", style: { color: TEAM_COLORS.A } }, "Team A"),
-      React.createElement("span", { key: "c", className: "mendi-count" }, String(aMendi.length)),
-      React.createElement("div", { key: "s", className: "mendi-slots" }, mendiSlots(aMendi)),
-      React.createElement("span", { key: "cc", className: "card-count" }, aCards + " cards")
-    ]),
-    React.createElement("div", { key: "tr", className: "trump-area" }, [
-      React.createElement("div", {
-        key: "tc",
-        className: "trump-card " + (!trumpRevealed ? "hidden" : "")
-      }, trumpRevealed ? trumpSuit : "?"),
-      React.createElement("span", { key: "tl", className: "trump-label" }, trumpRevealed ? "Trump" : "Hidden")
-    ]),
-    React.createElement("div", { key: "tb", className: "score-team" }, [
-      React.createElement("span", { key: "l", className: "team-label", style: { color: TEAM_COLORS.B } }, "Team B"),
-      React.createElement("span", { key: "c", className: "mendi-count" }, String(bMendi.length)),
-      React.createElement("div", { key: "s", className: "mendi-slots" }, mendiSlots(bMendi)),
-      React.createElement("span", { key: "cc", className: "card-count" }, bCards + " cards")
-    ])
-  ]);
-}
-
-function SeatMarker(props) {
-  const player = props.player;
-  const isActive = props.isActive;
-  const position = props.position;
-  const isBot = props.isBot;
-  const cardCount = props.cardCount;
-  const isDealer = props.isDealer;
-
-  const posClass = position === 0 ? "seat-bottom" : position === 1 ? "seat-right" : position === 2 ? "seat-top" : "seat-left";
-  const avatar = isBot ? "🤖" : (player ? player.name.charAt(0).toUpperCase() : "?");
-  const name = player ? player.name : "Empty";
-
-  return React.createElement("div", {
-    className: "seat-marker " + posClass + " " + (isActive ? "active " : " ") + (isBot ? "bot" : "")
-  }, [
-    React.createElement("div", { key: "av", className: "seat-avatar" }, [
-      avatar,
-      isDealer ? React.createElement("span", { key: "d", className: "dealer-badge" }, "D") : null
-    ]),
-    React.createElement("span", { key: "nm", className: "seat-name" }, name),
-    React.createElement("span", { key: "cc", className: "seat-cards" }, cardCount !== undefined ? cardCount + " cards" : "")
-  ]);
-}
-
-function TrickCenter(props) {
-  const trickCards = props.trickCards || [null, null, null, null];
-  const mySeat = props.mySeat;
-  const winner = props.winner;
-  const trickComplete = props.trickComplete;
-  const trickNum = props.trickNum;
-  const players = props.players || [];
-  const winnerPlayer = players.find(function(p) { return p.seat === winner; });
-
-  return React.createElement("div", { className: "trick-center-abs" }, [
-    [0,1,2,3].map(function(p) {
-      const actualSeat = (mySeat + p) % 4;
-      const card = trickCards[actualSeat];
-      const isWinner = trickComplete && winner === actualSeat;
-      const animStyle = trickComplete ? { animationDelay: (p * 0.1 + 0.5) + "s" } : {};
-      return React.createElement("div", {
-        key: "pos-" + trickNum + "-" + p,
-        className: "trick-card-pos pos-" + p + " " + (trickComplete ? "card-collect " : " ") + (isWinner ? "card-play-anim" : ""),
-        style: animStyle
-      }, card ? React.createElement(CardEl, { card: card, hidden: false, className: "card-pop-in" }) : null);
-    }),
-    trickComplete && winner !== null ? React.createElement("div", {
-      key: "wintext",
-      style: {
-        position: "absolute",
-        top: "50%",
-        left: "50%",
-        transform: "translate(-50%, -50%)",
-        background: "rgba(0,0,0,0.7)",
-        padding: "6px 14px",
-        borderRadius: "20px",
-        fontSize: "0.8rem",
-        fontWeight: 700,
-        color: "#fff",
-        zIndex: 5,
-        whiteSpace: "nowrap"
-      }
-    }, winnerPlayer ? winnerPlayer.name + " wins!" : "Winner") : null
-  ]);
-}
-
-function HandStrip(props) {
-  const hand = props.hand || [];
-  const gameState = props.gameState;
-  const mySeat = props.mySeat;
-  const onPlayCard = props.onPlayCard;
-
-  const handRef = useRef(null);
-  const [overlap, setOverlap] = useState(0);
-
-  useEffect(function() {
-    function calc() {
-      if (!handRef.current || !hand.length) { setOverlap(0); return; }
-      const containerW = handRef.current.clientWidth;
-      const isSmall = window.innerWidth < 400;
-      const cardW = isSmall ? 48 : (window.innerWidth >= 768 ? 64 : 56);
-      const totalWidth = cardW * hand.length;
-      const available = containerW - 16;
-      if (totalWidth > available) {
-        const ov = (totalWidth - available) / Math.max(hand.length - 1, 1);
-        setOverlap(Math.min(ov, cardW * 0.72));
-      } else {
-        setOverlap(0);
-      }
-    }
-    calc();
-    window.addEventListener("resize", calc);
-    return function() { window.removeEventListener("resize", calc); };
-  }, [hand.length]);
-
-  if (!hand.length) return null;
-
-  const current = gameState ? gameState.current_seat : -1;
-  const led = gameState ? gameState.led_suit : null;
-  const phase = gameState ? gameState.phase : 1;
-  const trump = gameState ? gameState.trump_suit : null;
-  const isMyTurn = current === mySeat;
-  const trickComplete = gameState ? gameState.trick_complete : false;
-
-  const mustReveal = isMyTurn && !trickComplete && led && phase === 1 && !trump && !hand.some(function(c) { return c.suit === led; });
-
-  return React.createElement("div", { className: "hand-strip", ref: handRef },
-    hand.map(function(card, i) {
-      let isLegal = false;
-      if (isMyTurn && !trickComplete) {
-        if (!led) {
-          isLegal = true;
-        } else {
-          const hasLed = hand.some(function(c) { return c.suit === led; });
-          if (hasLed) {
-            isLegal = card.suit === led;
-          } else {
-            isLegal = true;
-          }
-        }
-      }
-
-      return React.createElement("div", {
-        key: card.suit + "-" + card.rank,
-        className: "hand-card-wrapper",
-        style: { marginLeft: i > 0 ? -overlap : 0 }
-      }, [
-        mustReveal && isLegal ? React.createElement("button", {
-          key: "rev",
-          className: "reveal-btn",
-          onClick: function(e) { e.stopPropagation(); onPlayCard(card); }
-        }, "Reveal " + card.suit) : null,
-        React.createElement(CardEl, {
-          key: "c",
-          card: card,
-          index: i,
-          disabled: !isLegal,
-          className: "card-pop-in",
-          onClick: function() { if (isLegal) onPlayCard(card); }
-        })
-      ]);
-    })
-  );
-}
-
-function TrumpFlashOverlay(props) {
-  const suit = props.suit;
-  if (!suit) return null;
-  const bg = SUIT_BG_COLORS[suit] || "#1a5276";
-  return React.createElement("div", {
-    className: "trump-flash-overlay active",
-    style: { background: bg }
-  });
-}
-
-function TrumpStamp(props) {
-  const suit = props.suit;
-  const show = props.show;
-  if (!suit || !show) return null;
-  return React.createElement("div", { className: "trump-stamp show" }, [
-    React.createElement("span", { key: "s", style: { fontSize: "3rem" } }, suit),
-    React.createElement("span", { key: "t", style: { fontSize: "1.2rem", display: "block" } }, "TRUMP")
-  ]);
-}
-
-function ResultOverlay(props) {
-  const gameState = props.gameState;
-  const onRematch = props.onRematch;
-  const onExit = props.onExit;
-  const isHost = props.isHost;
-
-  if (!gameState || !gameState.game_over) return null;
-
-  const winner = gameState.winner;
-  const aMendi = (gameState.mendi && gameState.mendi.A) || [];
-  const bMendi = (gameState.mendi && gameState.mendi.B) || [];
-  const aScore = aMendi.length;
-  const bScore = bMendi.length;
-
-  let title = "Draw!";
-  let titleColor = "#fff";
-  if (winner === "A") { title = "Team A Wins!"; titleColor = TEAM_COLORS.A; }
-  if (winner === "B") { title = "Team B Wins!"; titleColor = TEAM_COLORS.B; }
-
-  const renderMiniCards = function(mendi) {
-    return mendi.map(function(c, i) {
-      return React.createElement("div", {
-        key: i,
-        className: "mini-card " + SUIT_COLORS[c.suit]
-      }, [
-        c.suit,
-        React.createElement("span", { key: "r", style: { fontSize: "0.5rem", display: "block" } }, c.rank)
-      ]);
-    });
-  };
-
-  const children = [
-    React.createElement("div", { key: "t", className: "overlay-title", style: { color: titleColor } }, title),
-    React.createElement("div", { key: "sc", className: "result-mendi" }, [
-      React.createElement("div", { key: "a", className: "result-team" }, [
-        React.createElement("div", { key: "l", className: "rt-label", style: { color: TEAM_COLORS.A } }, "Team A"),
-        React.createElement("div", { key: "s", className: "rt-score" }, String(aScore)),
-        React.createElement("div", { key: "c", className: "rt-mendi-cards" }, renderMiniCards(aMendi))
-      ]),
-      React.createElement("div", { key: "b", className: "result-team" }, [
-        React.createElement("div", { key: "l", className: "rt-label", style: { color: TEAM_COLORS.B } }, "Team B"),
-        React.createElement("div", { key: "s", className: "rt-score" }, String(bScore)),
-        React.createElement("div", { key: "c", className: "rt-mendi-cards" }, renderMiniCards(bMendi))
-      ])
-    ])
-  ];
-
-  if (isHost) {
-    children.push(React.createElement("button", {
-      key: "rem",
-      className: "btn btn-primary",
-      onClick: onRematch,
-      style: { marginTop: 16 }
-    }, "Rematch"));
-  }
-  children.push(React.createElement("button", {
-    key: "ex",
-    className: "btn btn-secondary",
-    onClick: onExit,
-    style: { marginTop: 8 }
-  }, "Exit to Menu"));
-
-  return React.createElement("div", { className: "overlay" },
-    React.createElement("div", { className: "overlay-content" }, children)
-  );
-}
-
-function ConfirmExitOverlay(props) {
-  return React.createElement("div", { className: "overlay" },
-    React.createElement("div", { className: "overlay-content" }, [
-      React.createElement("div", { key: "t", className: "overlay-title" }, "Leave Game?"),
-      React.createElement("p", { key: "m", style: { color: "rgba(255,255,255,0.7)", marginBottom: 20 } }, "This will end the game for everyone."),
-      React.createElement("div", { key: "b", className: "btn-row" }, [
-        React.createElement("button", { key: "y", className: "btn btn-danger", onClick: props.onConfirm }, "Leave"),
-        React.createElement("button", { key: "n", className: "btn btn-secondary", onClick: props.onCancel }, "Stay")
-      ])
-    ])
-  );
-}
-
-function ToastContainer(props) {
-  const toasts = props.toasts || [];
-  return React.createElement("div", { className: "toast-container" },
-    toasts.map(function(t) {
-      return React.createElement("div", { key: t.id, className: "toast" }, t.message);
-    })
-  );
-}
-
-function DisconnectOverlay(props) {
-  return React.createElement("div", { className: "overlay" },
-    React.createElement("div", { className: "overlay-content" }, [
-      React.createElement("div", { key: "t", className: "overlay-title", style: { color: "#ff8a65" } }, "Disconnected"),
-      React.createElement("p", { key: "m", style: { color: "rgba(255,255,255,0.7)", marginBottom: 20 } }, "Connection lost."),
-      React.createElement("button", { key: "r", className: "btn btn-primary", onClick: props.onReconnect }, "Reconnect"),
-      React.createElement("button", { key: "m", className: "btn btn-secondary", onClick: props.onMenu, style: { marginTop: 8 } }, "Main Menu")
-    ])
-  );
-}
-
-// ===== VIEWS =====
-
-function MenuView(props) {
-  return React.createElement("div", { className: "view-container" }, [
-    React.createElement("h1", { key: "logo", className: "logo" }, "MENDIKOT"),
-    React.createElement("p", { key: "sub", className: "subtitle" }, "The Classic Indian Card Game"),
-    React.createElement("button", { key: "solo", className: "btn btn-primary", onClick: props.onSolo }, "Solo vs Bots"),
-    React.createElement("button", { key: "multi", className: "btn btn-secondary", onClick: props.onMultiplayer }, "Play with Friends")
-  ]);
-}
-
-function HubView(props) {
-  return React.createElement("div", { className: "view-container" }, [
-    React.createElement("button", { key: "back", className: "back-btn", onClick: props.onBack }, "←"),
-    React.createElement("h2", { key: "t", className: "logo", style: { fontSize: "2rem", marginBottom: 40 } }, "Play with Friends"),
-    React.createElement("button", { key: "cr", className: "btn btn-primary", onClick: props.onCreate }, "Create Room"),
-    React.createElement("button", { key: "jr", className: "btn btn-secondary", onClick: props.onJoin }, "Join Room")
-  ]);
-}
-
-function CreateView(props) {
-  const savedName = (typeof localStorage !== "undefined" && localStorage.getItem("mendikot_name")) || "";
-  const [name, setName] = useState(savedName);
-  const [team, setTeam] = useState("A");
-
-  function handleCreate() {
-    if (!name.trim()) return;
-    if (typeof localStorage !== "undefined") localStorage.setItem("mendikot_name", name.trim());
-    props.onCreate(name.trim(), team);
+  // ---------------------------------------------------------------- Card
+  function Card(props) {
+    var c = props.card, rank = c.slice(0, -1), suit = c.slice(-1);
+    var st = props.w ? { width: props.w + "px", height: Math.round(props.w * 1.42) + "px",
+      fontSize: Math.round(props.w * 0.34) + "px" } : null;
+    return e("div", {
+      className: "card " + (isRed(suit) ? "red" : "blk") + (props.cls ? " " + props.cls : "") +
+        (props.pop ? " pop" : "") + (props.dim ? " dim" : "") + (props.glow ? " glow" : ""),
+      style: st, onClick: props.onClick
+    },
+      e("div", { className: "c-corner" },
+        e("div", null, rank), e("div", null, SUIT_GLYPH[suit])),
+      e("div", { className: "c-pip" }, SUIT_GLYPH[suit]));
   }
 
-  return React.createElement("div", { className: "view-container" }, [
-    React.createElement("button", { key: "back", className: "back-btn", onClick: props.onBack }, "←"),
-    React.createElement("h2", { key: "t", style: { color: "var(--gold)", marginBottom: 24 } }, "Create Room"),
-    React.createElement("label", { key: "ln", className: "form-label" }, "Your Name"),
-    React.createElement("input", {
-      key: "in",
-      className: "input",
-      value: name,
-      onChange: function(e) { setName(e.target.value); },
-      placeholder: "Enter your name",
-      maxLength: 20
-    }),
-    React.createElement("label", { key: "lt", className: "form-label" }, "Choose Team"),
-    React.createElement("div", { key: "ts", className: "team-select" }, [
-      React.createElement("div", {
-        key: "a",
-        className: "team-option team-a " + (team === "A" ? "selected" : ""),
-        onClick: function() { setTeam("A"); }
-      }, "Team A"),
-      React.createElement("div", {
-        key: "b",
-        className: "team-option team-b " + (team === "B" ? "selected" : ""),
-        onClick: function() { setTeam("B"); }
-      }, "Team B")
-    ]),
-    React.createElement("button", {
-      key: "go",
-      className: "btn btn-primary",
-      onClick: handleCreate,
-      disabled: !name.trim()
-    }, "Create")
-  ]);
-}
-
-function JoinView(props) {
-  const savedName = (typeof localStorage !== "undefined" && localStorage.getItem("mendikot_name")) || "";
-  const [name, setName] = useState(savedName);
-  const [code, setCode] = useState("");
-  const [team, setTeam] = useState("A");
-
-  function handleJoin() {
-    if (!name.trim() || !code.trim()) return;
-    if (typeof localStorage !== "undefined") localStorage.setItem("mendikot_name", name.trim());
-    props.onJoin(name.trim(), code.trim().toUpperCase(), team);
+  // ---------------------------------------------------------------- score cluster
+  function TenSlots(props) {
+    return e("div", { className: "ten-slots" }, ["S", "H", "D", "C"].map(function (s) {
+      if (props.suits.indexOf(s) >= 0) {
+        return e("div", { key: s, className: "ten-slot filled" },
+          e("span", { className: "ten-rank " + (isRed(s) ? "red" : "blk") }, "10"),
+          e("span", { className: "ten-suit " + (isRed(s) ? "red" : "blk") }, SUIT_GLYPH[s]));
+      }
+      return e("div", { key: s, className: "ten-slot" });
+    }));
+  }
+  function TeamPanel(props) {
+    var t = props.team;
+    return e("div", { className: "team-panel " + t.toLowerCase() },
+      e("div", { className: "team-name" }, "TEAM " + t),
+      e(TenSlots, { suits: props.gs.mendi[t] }),
+      e("div", { className: "card-count" }, props.gs.team_cards[t] + " cards"));
+  }
+  function ScoreCluster(props) {
+    var gs = props.gs;
+    return e("div", { className: "score-cluster" },
+      e(TeamPanel, { team: "A", gs: gs }),
+      e("div", { className: "trump-box" },
+        e("div", { className: "trump-label" }, gs.trump ? "TRUMP" : "TRUMP?"),
+        gs.trump_card
+          ? e(Card, { card: gs.trump_card, w: 42, pop: true })
+          : e("div", { className: "card back mini-card" }, "?")),
+      e(TeamPanel, { team: "B", gs: gs }));
   }
 
-  return React.createElement("div", { className: "view-container" }, [
-    React.createElement("button", { key: "back", className: "back-btn", onClick: props.onBack }, "←"),
-    React.createElement("h2", { key: "t", style: { color: "var(--gold)", marginBottom: 24 } }, "Join Room"),
-    React.createElement("label", { key: "ln", className: "form-label" }, "Your Name"),
-    React.createElement("input", {
-      key: "in",
-      className: "input",
-      value: name,
-      onChange: function(e) { setName(e.target.value); },
-      placeholder: "Enter your name",
-      maxLength: 20
-    }),
-    React.createElement("label", { key: "lc", className: "form-label" }, "Room Code"),
-    React.createElement("input", {
-      key: "ic",
-      className: "input",
-      value: code,
-      onChange: function(e) { setCode(e.target.value.toUpperCase()); },
-      placeholder: "Enter room code",
-      maxLength: 8
-    }),
-    React.createElement("label", { key: "lt", className: "form-label" }, "Choose Team"),
-    React.createElement("div", { key: "ts", className: "team-select" }, [
-      React.createElement("div", {
-        key: "a",
-        className: "team-option team-a " + (team === "A" ? "selected" : ""),
-        onClick: function() { setTeam("A"); }
-      }, "Team A"),
-      React.createElement("div", {
-        key: "b",
-        className: "team-option team-b " + (team === "B" ? "selected" : ""),
-        onClick: function() { setTeam("B"); }
-      }, "Team B")
-    ]),
-    React.createElement("button", {
-      key: "go",
-      className: "btn btn-primary",
-      onClick: handleJoin,
-      disabled: !name.trim() || !code.trim()
-    }, "Join Room")
-  ]);
-}
+  // ---------------------------------------------------------------- table pieces
+  function SeatMarker(props) {
+    var p = props.p;
+    return e("div", {
+      className: "seat-marker " + props.pos +
+        (props.active ? " active" : "") + (!p.connected ? " off" : "")
+    },
+      e("div", { className: "sm-name" }, p.name || "?"),
+      e("div", { className: "sm-sub" },
+        (p.is_bot ? "BOT \\u00b7 " : "") + props.count + " cards" + (p.connected ? "" : " \\u00b7 away")));
+  }
+  function TrickCenter(props) {
+    var gs = props.gs;
+    var cards = gs.trick.length ? gs.trick : (gs.paused ? gs.last_trick : []);
+    if (!cards.length) return e("div", { className: "trick-center" });
+    var cls = ["tc-self", "tc-left", "tc-top", "tc-right"];
+    return e("div", { className: "trick-center" }, cards.map(function (pc) {
+      var rel = (pc.seat - gs.seat + 4) % 4;
+      var won = gs.paused && !gs.trick.length && pc.seat === gs.last_trick_winner;
+      return e("div", { key: pc.seat + "-" + pc.card, className: "tc-pos " + cls[rel] },
+        e(Card, { card: pc.card, w: 54, pop: true, dim: gs.paused && !won, glow: won }));
+    }));
+  }
 
-function RoomView(props) {
-  const roomState = props.roomState;
-  if (!roomState) return null;
-  const players = roomState.players || [];
-  const isFull = players.every(function(p) { return p.name !== null; });
+  // ---------------------------------------------------------------- hand strip
+  function HandStrip(props) {
+    var gs = props.gs, n = gs.hand.length;
+    var ref = useRef(null);
+    var dims = useState({ w: 62, step: 32 }), d = dims[0], setDims = dims[1];
 
-  return React.createElement("div", { className: "view-container" }, [
-    React.createElement("button", { key: "back", className: "back-btn", onClick: props.onLeave }, "←"),
-    React.createElement("h2", { key: "t", style: { color: "var(--gold)", marginBottom: 8 } }, "Room Lobby"),
-    React.createElement("div", { key: "code", className: "room-code-display" }, [
-      React.createElement("div", { key: "l", style: { fontSize: "0.8rem", opacity: 0.7, marginBottom: 4 } }, "Room Code"),
-      React.createElement("div", { key: "c", className: "code" }, roomState.code)
-    ]),
-    React.createElement("div", { key: "seats", className: "seats-grid" },
-      players.map(function(p) {
-        return React.createElement("div", {
-          key: p.seat,
-          className: "seat-box " + (p.name ? "filled" : "")
-        }, [
-          React.createElement("div", { key: "n", className: "seat-name" }, p.name || "Open"),
-          React.createElement("div", {
-            key: "t",
-            className: "seat-team",
-            style: { color: TEAM_COLORS[p.team] || "#fff" }
-          }, p.team ? "Team " + p.team : "")
-        ]);
-      })
-    ),
-    props.isHost
-      ? React.createElement("button", {
-          key: "start",
-          className: "btn btn-primary",
-          onClick: props.onStart,
-          disabled: !isFull
-        }, isFull ? "Start Game" : "Waiting for players...")
-      : React.createElement("p", { key: "wait", className: "waiting-text" }, "Waiting for host to start..."),
-    React.createElement("button", {
-      key: "leave",
-      className: "btn btn-danger",
-      onClick: props.onLeave,
-      style: { marginTop: 12, opacity: 0.8 }
-    }, "Leave Room")
-  ]);
-}
+    useEffect(function () {
+      var el = ref.current;
+      if (!el) return;
+      var compute = function () {
+        var avail = el.clientWidth - 16, base = 62, r = 0.52;
+        if (n <= 1) { setDims({ w: base, step: base }); return; }
+        var need = base + (n - 1) * base * r;
+        var scale = need > avail ? avail / need : 1;
+        var w2 = Math.max(30, Math.floor(base * scale));
+        setDims({ w: w2, step: Math.floor(w2 * r) });
+      };
+      compute();
+      var ro = new ResizeObserver(compute);
+      ro.observe(el);
+      return function () { ro.disconnect(); };
+    }, [n]);
 
-function GameView(props) {
-  const gameState = props.gameState;
-  if (!gameState) return null;
+    var w = d.w, overlap = -(w - d.step);
+    var styleTxt = ".hcard{width:" + w + "px;height:" + Math.round(w * 1.42) +
+      "px;font-size:" + Math.round(w * 0.32) + "px;border-radius:" +
+      Math.max(4, Math.round(w * 0.11)) + "px}.hcard-wrap+.hcard-wrap{margin-left:" + overlap + "px}";
 
-  const players = gameState.players || [];
-  const myPlayer = players.find(function(p) { return p.seat === props.mySeat; }) || {};
-  const myHand = myPlayer.hand || [];
-  const trickCards = gameState.trick_cards || [null, null, null, null];
-  const currentSeat = gameState.current_seat;
-  const trickComplete = gameState.trick_complete || false;
-  const trickWinner = gameState.trick_winner_seat;
-  const gameOver = gameState.game_over || false;
-  const dealerSeat = gameState.dealer_seat;
-  const bootDealt = gameState.boot_dealt;
+    var myTurn = props.myTurn;
+    var legal = myTurn ? gs.legal : [];
+    return e("div", { className: "hand-area" },
+      e("style", null, styleTxt),
+      (gs.must_reveal && myTurn) ? e("div", { className: "reveal-bar" },
+        props.selected
+          ? e("button", { className: "btn gold",
+              onClick: function () { props.revealCard(props.selected); } },
+              "Reveal " + cardLabel(props.selected) + " as trump")
+          : e("div", { className: "reveal-hint" },
+              "You can't follow suit \\u2014 tap a card to reveal it as trump")) : null,
+      e("div", { className: "hand-strip", ref: ref }, gs.hand.map(function (c) {
+        var isLegal = legal.indexOf(c) >= 0;
+        var sel = props.selected === c;
+        return e("div", { key: c, className: "hcard-wrap" + (sel ? " sel" : "") },
+          e(Card, {
+            card: c, cls: "hcard " + (isLegal ? "legal" : "idle"),
+            onClick: function () {
+              if (!myTurn) return;
+              if (gs.must_reveal) props.setSelected(sel ? null : c);
+              else if (isLegal) props.playCard(c);
+            }
+          }));
+      })));
+  }
 
-  return React.createElement("div", { className: "game-container" }, [
-    React.createElement(ScoreBoard, { key: "sb", gameState: gameState, mySeat: props.mySeat }),
-    React.createElement("div", { key: "exit", className: "exit-btn", onClick: props.onExit }, "✕"),
-    React.createElement("div", { key: "tcnt", className: "trick-counter" }, "Trick " + gameState.trick_num + "/13"),
-    React.createElement("div", { key: "table", className: "table-area" }, [
-      [0, 1, 2, 3].map(function(p) {
-        const actualSeat = (props.mySeat + p) % 4;
-        const player = players.find(function(pl) { return pl.seat === actualSeat; });
-        const isActive = currentSeat === actualSeat && !trickComplete && !gameOver;
-        return React.createElement(SeatMarker, {
-          key: "seat-" + p,
-          player: player,
-          isActive: isActive,
-          position: p,
-          isBot: player ? player.is_bot : false,
-          cardCount: player ? player.hand_size : 0,
-          isDealer: dealerSeat === actualSeat
-        });
-      }),
-      React.createElement("div", { key: "felt", className: "table-felt" }, [
-        !bootDealt ? React.createElement("div", {
-          key: "boot",
-          style: {
-            position: "absolute",
-            top: 8,
-            left: "50%",
-            transform: "translateX(-50%)",
-            fontSize: "0.65rem",
-            color: "rgba(255,255,255,0.5)",
-            background: "rgba(0,0,0,0.3)",
-            padding: "2px 10px",
-            borderRadius: 10,
-            zIndex: 5
-          }
-        }, "Boot: 32 cards") : null,
-        React.createElement(TrickCenter, {
-          key: "tc",
-          trickCards: trickCards,
-          mySeat: props.mySeat,
-          winner: trickWinner,
-          trickComplete: trickComplete,
-          trickNum: gameState.trick_num,
-          players: players
+  // ---------------------------------------------------------------- overlays
+  function TrumpFlash(props) {
+    var f = props.flash;
+    return e("div", { key: f.id, className: "trump-flash" },
+      e("div", { className: "tf-glyph " + (isRed(f.suit) ? "red" : "blk") }, SUIT_GLYPH[f.suit]),
+      e("div", { className: "tf-label" }, cardLabel(f.card) + " \\u2014 " + SUIT_NAME[f.suit] + " is trump"));
+  }
+  function ResultOverlay(props) {
+    var gs = props.gs;
+    var title = gs.winner ? "Team " + gs.winner + " wins the hand!" : "Hand drawn \\u2014 2\\u00b72";
+    return e("div", { className: "overlay" },
+      e("div", { className: "panel" },
+        e("h2", null, title),
+        e("div", { className: "result-rows" },
+          e("div", null, "Team A \\u2014 " + gs.mendi.A.length + " mendi (" + gs.team_cards.A + " cards)"),
+          e("div", null, "Team B \\u2014 " + gs.mendi.B.length + " mendi (" + gs.team_cards.B + " cards)")),
+        props.me && props.me.host
+          ? e("button", { className: "btn gold", onClick: props.onRematch }, "Rematch")
+          : e("div", { className: "muted small" }, "Waiting for the host to start a rematch\\u2026"),
+        e("button", { className: "btn ghost", onClick: props.onExit }, "Leave")));
+  }
+  function ConfirmExit(props) {
+    return e("div", { className: "overlay" },
+      e("div", { className: "panel" },
+        e("h3", null, "Leave the game?"),
+        e("p", { className: "muted small" }, "This cancels the game for everyone at the table."),
+        e("button", { className: "btn gold", onClick: props.onYes }, "Yes, leave"),
+        e("button", { className: "btn ghost", onClick: props.onNo }, "Keep playing")));
+  }
+
+  // ---------------------------------------------------------------- menu views
+  function MenuView(props) {
+    return e("div", { className: "view center" },
+      e("div", { className: "logo" },
+        e("h1", null, "MENDIKOT"),
+        e("p", { className: "tagline" }, "Capture the mendi \\u2014 the four tens")),
+      e("button", { className: "btn gold big", onClick: props.onSolo },
+        "Solo", e("span", { className: "btn-sub" }, "Instant game vs 3 bots")),
+      e("button", { className: "btn green big", onClick: props.onFriends },
+        "Play with Friends", e("span", { className: "btn-sub" }, "Create or join a room")));
+  }
+  function HubView(props) {
+    return e("div", { className: "view" },
+      e("h2", null, "Play with Friends"),
+      e("button", { className: "btn gold big", onClick: props.onCreate },
+        "Create Room", e("span", { className: "btn-sub" }, "Get a code to share")),
+      e("button", { className: "btn green big", onClick: props.onJoin },
+        "Join Room", e("span", { className: "btn-sub" }, "Enter a room code")),
+      e("button", { className: "btn ghost", onClick: props.onBack }, "Back"));
+  }
+  function TeamPicker(props) {
+    return e("div", { className: "team-pick" }, ["A", "B"].map(function (t) {
+      return e("button", {
+        key: t, type: "button",
+        className: "team-btn " + t.toLowerCase() + (props.team === t ? " sel" : ""),
+        onClick: function () { props.setTeam(t); }
+      }, "Team " + t, e("span", { className: "btn-sub" }, "You + one partner"));
+    }));
+  }
+  function CreateView(props) {
+    var n = useState(props.initial), name = n[0], setName = n[1];
+    var t = useState("A"), team = t[0], setTeam = t[1];
+    return e("div", { className: "view" },
+      e("h2", null, "Create Room"),
+      e("label", { className: "fld" }, "Your name",
+        e("input", { value: name, maxLength: 18, placeholder: "Enter your name",
+          onChange: function (ev) { setName(ev.target.value); } })),
+      e("div", { className: "fld" }, "Pick your team"),
+      e(TeamPicker, { team: team, setTeam: setTeam }),
+      e("button", { className: "btn gold big", disabled: !name.trim(),
+        onClick: function () { props.onSubmit(name.trim(), team); } }, "Create Room"),
+      e("button", { className: "btn ghost", onClick: props.onBack }, "Back"));
+  }
+  function JoinView(props) {
+    var n = useState(props.initial), name = n[0], setName = n[1];
+    var c = useState(""), code = c[0], setCode = c[1];
+    var t = useState("A"), team = t[0], setTeam = t[1];
+    return e("div", { className: "view" },
+      e("h2", null, "Join Room"),
+      e("label", { className: "fld" }, "Your name",
+        e("input", { value: name, maxLength: 18, placeholder: "Enter your name",
+          onChange: function (ev) { setName(ev.target.value); } })),
+      e("label", { className: "fld" }, "Room code",
+        e("input", { value: code, maxLength: 5, placeholder: "e.g. 7KQ2M",
+          style: { textTransform: "uppercase", letterSpacing: "4px" },
+          onChange: function (ev) { setCode(ev.target.value.toUpperCase()); } })),
+      e("div", { className: "fld" }, "Pick your team"),
+      e(TeamPicker, { team: team, setTeam: setTeam }),
+      e("button", { className: "btn gold big", disabled: !name.trim() || code.trim().length < 4,
+        onClick: function () { props.onSubmit(name.trim(), code.trim(), team); } }, "Join Room"),
+      e("button", { className: "btn ghost", onClick: props.onBack }, "Back"));
+  }
+  function RoomView(props) {
+    var lobby = props.lobby, me = props.me;
+    if (!lobby) return e("div", { className: "view center" }, "Loading\\u2026");
+    var seatCard = function (s) {
+      return e("div", { key: s.seat, className: "lobby-seat" + (s.name ? "" : " open") },
+        s.name
+          ? e(FR, null,
+              e("div", { className: "ls-name" }, s.name,
+                s.host ? e("span", { className: "chip" }, "HOST") : null,
+                s.is_bot ? e("span", { className: "chip" }, "BOT") : null),
+              e("div", { className: "ls-sub" }, s.connected ? "Ready" : "\\u2026"))
+          : e("div", { className: "ls-name muted" }, "Open seat"));
+    };
+    var canStart = lobby.full && me && me.host;
+    return e("div", { className: "view" },
+      e("h2", null, "Room ", e("span", { className: "room-code" }, lobby.code)),
+      e("p", { className: "muted small", style: { marginTop: 0 } }, "Share this code with your friends"),
+      e("div", { className: "lobby-teams" },
+        e("div", { className: "lobby-team ta" },
+          e("div", { className: "lt-title" }, "Team A"),
+          lobby.seats.filter(function (s) { return s.team === "A"; }).map(seatCard)),
+        e("div", { className: "lobby-team tb" },
+          e("div", { className: "lt-title" }, "Team B"),
+          lobby.seats.filter(function (s) { return s.team === "B"; }).map(seatCard))),
+      canStart
+        ? e("button", { className: "btn gold big", onClick: props.onStart }, "Start Game")
+        : e("div", { className: "muted center-text" },
+            lobby.full ? "Waiting for host to start\\u2026" : "Waiting for players\\u2026"),
+      e("button", { className: "btn ghost", onClick: props.onLeave }, "Leave Room"));
+  }
+  function GameView(props) {
+    var gs = props.gs, me = props.me;
+    if (!gs) return e("div", { className: "view center" }, "Dealing cards\\u2026");
+    var myTurn = gs.turn === gs.seat && !gs.paused && !gs.complete;
+    var status;
+    if (gs.complete) status = "";
+    else if (gs.paused) status = "Trick complete\\u2026";
+    else if (myTurn) status = gs.must_reveal ? "Reveal trump!" : "Your turn";
+    else status = seatName(gs, gs.turn) + " is playing\\u2026";
+    var posCls = { 1: "pos-left", 2: "pos-top", 3: "pos-right" };
+    return e("div", { className: "game" },
+      e("div", { className: "game-top" },
+        e("span", { className: "chip" }, me && !me.solo ? "Room " + me.code : "Solo"),
+        e("span", { className: "status-line" }, status),
+        e("button", { className: "icon-btn", onClick: props.onExit }, "\\u2715")),
+      e(ScoreCluster, { gs: gs }),
+      e("div", { className: "felt" },
+        [1, 2, 3].map(function (dd) {
+          var s = (gs.seat + dd) % 4;
+          var p = gs.seats.find(function (x) { return x.seat === s; });
+          return e(SeatMarker, { key: s, p: p, pos: posCls[dd], count: gs.hand_sizes[s],
+            active: gs.turn === s && !gs.paused && !gs.complete });
         }),
-        React.createElement(TrumpStamp, {
-          key: "stamp",
-          suit: gameState.trump_suit,
-          show: gameState.trump_revealed
-        })
-      ])
-    ]),
-    React.createElement(HandStrip, {
-      key: "hand",
-      hand: myHand,
-      gameState: gameState,
-      mySeat: props.mySeat,
-      onPlayCard: props.onPlayCard
-    }),
-    gameOver
-      ? React.createElement(ResultOverlay, {
-          key: "res",
-          gameState: gameState,
-          onRematch: props.onRematch,
-          onExit: props.onExit,
-          isHost: props.isHost
-        })
-      : null
-  ]);
-}
-
-// ===== APP =====
-
-function App() {
-  const wsRef = useRef(null);
-  const reconnectAttempts = useRef(0);
-  const trumpTimeoutRef = useRef(null);
-  const toastIdRef = useRef(0);
-
-  const [view, setView] = useState("menu");
-  const [roomCode, setRoomCode] = useState("");
-  const [mySeat, setMySeat] = useState(null);
-  const [gameState, setGameState] = useState(null);
-  const [roomState, setRoomState] = useState(null);
-  const [toasts, setToasts] = useState([]);
-  const [showConfirmExit, setShowConfirmExit] = useState(false);
-  const [disconnected, setDisconnected] = useState(false);
-  const [isHost, setIsHost] = useState(false);
-  const [trumpFlash, setTrumpFlash] = useState(null);
-  const [connecting, setConnecting] = useState(false);
-
-  function send(msg) {
-    if (wsRef.current && wsRef.current.readyState === 1) {
-      wsRef.current.send(JSON.stringify(msg));
-      return true;
-    }
-    return false;
+        e(TrickCenter, { gs: gs })),
+      e(HandStrip, { gs: gs, myTurn: myTurn, selected: props.selected,
+        setSelected: props.setSelected, playCard: props.playCard, revealCard: props.revealCard }),
+      gs.complete ? e(ResultOverlay, { gs: gs, me: me, onRematch: props.onRematch, onExit: props.onExit }) : null);
   }
 
-  function addToast(message) {
-    const id = ++toastIdRef.current;
-    setToasts(function(prev) { return [...prev, { id: id, message: message }]; });
-    setTimeout(function() {
-      setToasts(function(prev) { return prev.filter(function(t) { return t.id !== id; }); });
-    }, 3000);
-  }
+  // ---------------------------------------------------------------- app root
+  function App() {
+    var v = useState("menu"), view = v[0], setView = v[1];
+    var m = useState(null), me = m[0], setMe = m[1];
+    var l = useState(null), lobby = l[0], setLobby = l[1];
+    var g = useState(null), gs = g[0], setGs = g[1];
+    var f = useState(null), flash = f[0], setFlash = f[1];
+    var to = useState(null), toast = to[0], setToast = to[1];
+    var ce = useState(false), confirmExit = ce[0], setConfirmExit = ce[1];
+    var rc = useState(false), reconnecting = rc[0], setReconnecting = rc[1];
+    var se = useState(null), selected = se[0], setSelected = se[1];
 
-  const connect = useCallback(function() {
-    if (wsRef.current && (wsRef.current.readyState === 0 || wsRef.current.readyState === 1)) {
-      return;
-    }
-    setConnecting(true);
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(protocol + "//" + window.location.host + "/ws");
-    wsRef.current = ws;
+    var wsRef = useRef(null), meRef = useRef(null), queueRef = useRef([]),
+        retryRef = useRef(0), leavingRef = useRef(false), toastTimer = useRef(null);
 
-    ws.onopen = function() {
-      setConnecting(false);
-      setDisconnected(false);
-      reconnectAttempts.current = 0;
+    var showToast = function (msg) {
+      setToast({ msg: msg, id: Date.now() });
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      toastTimer.current = setTimeout(function () { setToast(null); }, 2600);
+    };
 
-      // Try to reconnect to previous room
-      const savedRoom = sessionStorage.getItem("mendikot_room");
-      const savedSeat = sessionStorage.getItem("mendikot_seat");
-      if (savedRoom && view === "menu") {
-        // We were in a room before, but for now just stay in menu
-        // Reconnect logic would need more work
+    var hardReset = function (msg) {
+      meRef.current = null;
+      setMe(null); setGs(null); setLobby(null); setSelected(null); setConfirmExit(false);
+      sessionStorage.removeItem("mk_pid"); sessionStorage.removeItem("mk_code");
+      setView("menu");
+      if (msg) showToast(msg);
+    };
+
+    var send = function (obj) {
+      var ws = wsRef.current;
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+      else queueRef.current.push(obj);
+    };
+
+    var onMsg = function (msg) {
+      switch (msg.type) {
+        case "joined": {
+          var mm = { pid: msg.player_id, code: msg.code, seat: msg.seat, host: msg.host, solo: msg.solo };
+          meRef.current = mm; setMe(mm);
+          sessionStorage.setItem("mk_pid", mm.pid);
+          sessionStorage.setItem("mk_code", mm.code);
+          if (!mm.solo) setView("room");
+          break;
+        }
+        case "lobby":
+          setLobby(msg); setView("room");
+          if (msg.you && meRef.current) {
+            meRef.current = Object.assign({}, meRef.current, { seat: msg.you.seat, host: msg.you.host });
+            setMe(meRef.current);
+          }
+          break;
+        case "game_start": setGs(null); setSelected(null); setView("game"); break;
+        case "new_hand": setSelected(null); break;
+        case "game_state":
+          setGs(msg); setView("game");
+          if (meRef.current) {
+            meRef.current = Object.assign({}, meRef.current, { seat: msg.seat });
+            setMe(meRef.current);
+          }
+          break;
+        case "card_played":
+          if (meRef.current && msg.seat === meRef.current.seat) setSelected(null);
+          break;
+        case "trump_revealed": setFlash({ suit: msg.suit, card: msg.card, id: Date.now() }); break;
+        case "boot_dealt": showToast("Boot dealt \\u2014 8 new cards each"); break;
+        case "seat_status": {
+          var patch = function (list) {
+            return list && list.map(function (s) {
+              return s.seat === msg.seat ? Object.assign({}, s, { connected: msg.connected }) : s;
+            });
+          };
+          setGs(function (x) { return x ? Object.assign({}, x, { seats: patch(x.seats) }) : x; });
+          setLobby(function (x) { return x ? Object.assign({}, x, { seats: patch(x.seats) }) : x; });
+          break;
+        }
+        case "room_cancelled":
+          if (leavingRef.current) hardReset(null);
+          else hardReset(msg.reason ? "Room closed \\u2014 " + msg.reason : "Room closed");
+          break;
+        case "rejoin_failed": hardReset(msg.message || "Could not rejoin"); break;
+        case "error": showToast(msg.message || "Error"); break;
+        default: break;
       }
     };
 
-    ws.onmessage = function(e) {
-      try {
-        const msg = JSON.parse(e.data);
-        handleMessage(msg);
-      } catch(err) {
-        console.error("WS parse error", err);
-      }
+    var connect = function () {
+      var ws0 = wsRef.current;
+      if (ws0 && (ws0.readyState === 0 || ws0.readyState === 1)) return;
+      var proto = location.protocol === "https:" ? "wss" : "ws";
+      var ws = new WebSocket(proto + "://" + location.host + "/ws");
+      wsRef.current = ws;
+      ws.onopen = function () {
+        retryRef.current = 0; setReconnecting(false);
+        if (meRef.current && meRef.current.pid) {
+          ws.send(JSON.stringify({ type: "rejoin", code: meRef.current.code, player_id: meRef.current.pid }));
+        }
+        while (queueRef.current.length) ws.send(JSON.stringify(queueRef.current.shift()));
+      };
+      ws.onmessage = function (ev) { try { onMsg(JSON.parse(ev.data)); } catch (ex) {} };
+      ws.onclose = function () {
+        if (meRef.current && retryRef.current < 10) {
+          retryRef.current += 1; setReconnecting(true);
+          setTimeout(connect, 1200);
+        } else if (meRef.current) {
+          hardReset("Connection lost");
+        }
+      };
     };
 
-    ws.onclose = function() {
-      setConnecting(false);
-      wsRef.current = null;
-      if (view !== "menu") {
-        setDisconnected(true);
+    useEffect(function () {
+      if (!flash) return;
+      var t = setTimeout(function () { setFlash(null); }, 1200);
+      return function () { clearTimeout(t); };
+    }, [flash]);
+
+    useEffect(function () {
+      var pid = sessionStorage.getItem("mk_pid");
+      var code = sessionStorage.getItem("mk_code");
+      if (pid && code) {
+        meRef.current = { pid: pid, code: code, seat: null, host: false, solo: false };
+        setReconnecting(true);
+        connect();
       }
+    }, []);
+
+    var getName = function () { return localStorage.getItem("mk_name") || ""; };
+    var saveName = function (n) { localStorage.setItem("mk_name", n); };
+    var act = function (obj) { connect(); send(obj); };
+
+    var leaveAction = function () {
+      leavingRef.current = true;
+      send({ type: "leave" });
+      setTimeout(function () { leavingRef.current = false; }, 1500);
+      hardReset(null);
+      setView("hub");
     };
 
-    ws.onerror = function() {
-      setConnecting(false);
-      if (wsRef.current) {
-        try { wsRef.current.close(); } catch(e) {}
-      }
-      wsRef.current = null;
-    };
-  }, [view]);
+    var content;
+    if (view === "menu") content = e(MenuView, {
+      onSolo: function () { act({ type: "start_solo", name: getName() || "Player" }); },
+      onFriends: function () { setView("hub"); } });
+    else if (view === "hub") content = e(HubView, {
+      onCreate: function () { setView("create"); },
+      onJoin: function () { setView("join"); },
+      onBack: function () { setView("menu"); } });
+    else if (view === "create") content = e(CreateView, { initial: getName(),
+      onSubmit: function (n, t) { saveName(n); act({ type: "create_room", name: n, team: t }); },
+      onBack: function () { setView("hub"); } });
+    else if (view === "join") content = e(JoinView, { initial: getName(),
+      onSubmit: function (n, c, t) { saveName(n); act({ type: "join_room", name: n, code: c, team: t }); },
+      onBack: function () { setView("hub"); } });
+    else if (view === "room") content = e(RoomView, { lobby: lobby, me: me,
+      onStart: function () { send({ type: "start_game" }); }, onLeave: leaveAction });
+    else content = e(GameView, { gs: gs, me: me, selected: selected, setSelected: setSelected,
+      playCard: function (c) { send({ type: "play_card", card: c }); },
+      revealCard: function (c) { setSelected(null); send({ type: "reveal_trump", card: c }); },
+      onExit: function () { setConfirmExit(true); },
+      onRematch: function () { send({ type: "rematch" }); } });
 
-  function handleMessage(msg) {
-    switch(msg.type) {
-      case "room_created":
-        setRoomCode(msg.room_code);
-        setMySeat(msg.seat);
-        setRoomState(msg.state);
-        setIsHost(true);
-        setView("room");
-        sessionStorage.setItem("mendikot_room", msg.room_code);
-        sessionStorage.setItem("mendikot_seat", msg.seat);
-        break;
-
-      case "room_joined":
-        setRoomCode(msg.room_code);
-        setMySeat(msg.seat);
-        setRoomState(msg.state);
-        setIsHost(false);
-        setView("room");
-        sessionStorage.setItem("mendikot_room", msg.room_code);
-        sessionStorage.setItem("mendikot_seat", msg.seat);
-        break;
-
-      case "player_joined":
-      case "player_left":
-        setRoomState(msg.state);
-        break;
-
-      case "game_started":
-        setGameState(msg.state);
-        setMySeat(msg.seat);
-        setView("game");
-        setDisconnected(false);
-        setTrumpFlash(null);
-        break;
-
-      case "card_played":
-        setGameState(function(prev) {
-          if (!prev) return prev;
-          const newTrick = prev.trick_cards ? [...prev.trick_cards] : [null, null, null, null];
-          newTrick[msg.seat] = msg.card;
-
-          const newPlayers = prev.players.map(function(p) {
-            if (p.seat === msg.seat) {
-              const newHandSize = Math.max(0, (p.hand_size || 0) - 1);
-              let newHand = p.hand;
-              if (p.hand) {
-                newHand = p.hand.filter(function(c) {
-                  return !(c.suit === msg.card.suit && c.rank === msg.card.rank);
-                });
-              }
-              return Object.assign({}, p, { hand: newHand, hand_size: newHandSize });
-            }
-            return p;
-          });
-
-          return Object.assign({}, prev, {
-            trick_cards: newTrick,
-            players: newPlayers,
-            current_seat: msg.current_seat !== undefined ? msg.current_seat : prev.current_seat,
-            led_suit: prev.led_suit || msg.card.suit,
-            trick_leader: prev.trick_leader !== null ? prev.trick_leader : msg.seat,
-            trump_suit: msg.revealed_now ? msg.card.suit : prev.trump_suit,
-            trump_revealed: msg.revealed_now ? true : prev.trump_revealed,
-            trump_revealer: msg.revealed_now ? msg.seat : prev.trump_revealer,
-            trump_card: msg.revealed_now ? msg.card : prev.trump_card
-          });
-        });
-        break;
-
-      case "trump_revealed":
-        setTrumpFlash({ suit: msg.suit, active: true });
-        if (trumpTimeoutRef.current) clearTimeout(trumpTimeoutRef.current);
-        trumpTimeoutRef.current = setTimeout(function() {
-          setTrumpFlash(null);
-        }, 1500);
-        break;
-
-      case "trick_won":
-        setGameState(function(prev) {
-          if (!prev) return prev;
-          const winningTeam = msg.winning_team;
-          const tensWon = msg.tens_won || [];
-          const trickLen = msg.trick_cards ? msg.trick_cards.length : 0;
-
-          const newMendiA = winningTeam === "A"
-            ? [...(prev.mendi && prev.mendi.A ? prev.mendi.A : []), ...tensWon]
-            : (prev.mendi && prev.mendi.A ? prev.mendi.A : []);
-          const newMendiB = winningTeam === "B"
-            ? [...(prev.mendi && prev.mendi.B ? prev.mendi.B : []), ...tensWon]
-            : (prev.mendi && prev.mendi.B ? prev.mendi.B : []);
-
-          return Object.assign({}, prev, {
-            trick_complete: true,
-            trick_winner_seat: msg.winner_seat,
-            mendi: { A: newMendiA, B: newMendiB },
-            cards_won: {
-              A: winningTeam === "A" ? (prev.cards_won && prev.cards_won.A || 0) + trickLen : (prev.cards_won && prev.cards_won.A || 0),
-              B: winningTeam === "B" ? (prev.cards_won && prev.cards_won.B || 0) + trickLen : (prev.cards_won && prev.cards_won.B || 0)
-            },
-            tricks_won: {
-              A: winningTeam === "A" ? (prev.tricks_won && prev.tricks_won.A || 0) + 1 : (prev.tricks_won && prev.tricks_won.A || 0),
-              B: winningTeam === "B" ? (prev.tricks_won && prev.tricks_won.B || 0) + 1 : (prev.tricks_won && prev.tricks_won.B || 0)
-            }
-          });
-        });
-
-        var tensCount = msg.tens_won ? msg.tens_won.length : 0;
-        var winMsg = "Team " + msg.winning_team + " wins the trick!";
-        if (tensCount > 0) winMsg += " +" + tensCount + " mendi!";
-        addToast(winMsg);
-        break;
-
-      case "next_trick":
-        setGameState(msg.state);
-        break;
-
-      case "boot_dealt":
-        addToast("Boot dealt! 8 new cards each");
-        break;
-
-      case "game_over":
-        setGameState(msg.state);
-        break;
-
-      case "room_cancelled":
-        addToast(msg.reason || "Room cancelled");
-        setView("menu");
-        setRoomCode("");
-        setGameState(null);
-        setRoomState(null);
-        sessionStorage.removeItem("mendikot_room");
-        sessionStorage.removeItem("mendikot_seat");
-        break;
-
-      case "error":
-        addToast(msg.message || "Error occurred");
-        break;
-
-      case "pong":
-        break;
-
-      default:
-        console.log("Unknown message", msg);
-    }
+    return e("div", { className: "app" },
+      content,
+      reconnecting ? e("div", { className: "reconnect-banner" }, "Reconnecting\\u2026") : null,
+      flash ? e(TrumpFlash, { flash: flash }) : null,
+      confirmExit ? e(ConfirmExit, {
+        onYes: function () { setConfirmExit(false); leaveAction(); },
+        onNo: function () { setConfirmExit(false); } }) : null,
+      toast ? e("div", { key: toast.id, className: "toast" }, toast.msg) : null);
   }
 
-  useEffect(function() {
-    connect();
-
-    const pingInterval = setInterval(function() {
-      if (wsRef.current && wsRef.current.readyState === 1) {
-        send({ action: "ping" });
-      }
-    }, 30000);
-
-    return function() {
-      clearInterval(pingInterval);
-      if (trumpTimeoutRef.current) clearTimeout(trumpTimeoutRef.current);
-      if (wsRef.current) {
-        try { wsRef.current.close(); } catch(e) {}
-        wsRef.current = null;
-      }
-    };
-  }, [connect]);
-
-  function handleSolo() {
-    var name = (typeof localStorage !== "undefined" && localStorage.getItem("mendikot_name")) || "Player";
-    send({ action: "start_solo", name: name });
-  }
-
-  function handleCreateRoom(name, team) {
-    send({ action: "create_room", name: name, team: team });
-  }
-
-  function handleJoinRoom(name, code, team) {
-    send({ action: "join_room", name: name, room_code: code, team: team });
-  }
-
-  function handleStartGame() {
-    send({ action: "start_game" });
-  }
-
-  function handlePlayCard(card) {
-    send({ action: "play_card", card: { suit: card.suit, rank: card.rank } });
-  }
-
-  function handleRematch() {
-    send({ action: "rematch" });
-  }
-
-  function handleLeaveRoom() {
-    send({ action: "leave_room" });
-    setView("menu");
-    setRoomCode("");
-    setGameState(null);
-    setRoomState(null);
-    sessionStorage.removeItem("mendikot_room");
-    sessionStorage.removeItem("mendikot_seat");
-  }
-
-  function handleConfirmExit() {
-    send({ action: "leave_room" });
-    setShowConfirmExit(false);
-    setView("menu");
-    setRoomCode("");
-    setGameState(null);
-    setRoomState(null);
-    sessionStorage.removeItem("mendikot_room");
-    sessionStorage.removeItem("mendikot_seat");
-  }
-
-  function handleReconnect() {
-    window.location.reload();
-  }
-
-  var children = [];
-
-  if (view === "menu") {
-    children.push(React.createElement(MenuView, {
-      key: "vm",
-      onSolo: handleSolo,
-      onMultiplayer: function() { setView("hub"); }
-    }));
-  }
-
-  if (view === "hub") {
-    children.push(React.createElement(HubView, {
-      key: "vh",
-      onCreate: function() { setView("create"); },
-      onJoin: function() { setView("join"); },
-      onBack: function() { setView("menu"); }
-    }));
-  }
-
-  if (view === "create") {
-    children.push(React.createElement(CreateView, {
-      key: "vc",
-      onCreate: handleCreateRoom,
-      onBack: function() { setView("hub"); }
-    }));
-  }
-
-  if (view === "join") {
-    children.push(React.createElement(JoinView, {
-      key: "vj",
-      onJoin: handleJoinRoom,
-      onBack: function() { setView("hub"); }
-    }));
-  }
-
-  if (view === "room") {
-    children.push(React.createElement(RoomView, {
-      key: "vr",
-      roomState: roomState,
-      mySeat: mySeat,
-      isHost: isHost,
-      onStart: handleStartGame,
-      onLeave: handleLeaveRoom
-    }));
-  }
-
-  if (view === "game") {
-    children.push(React.createElement(GameView, {
-      key: "vg",
-      gameState: gameState,
-      mySeat: mySeat,
-      onPlayCard: handlePlayCard,
-      onExit: function() { setShowConfirmExit(true); },
-      isHost: isHost,
-      onRematch: handleRematch
-    }));
-  }
-
-  if (showConfirmExit) {
-    children.push(React.createElement(ConfirmExitOverlay, {
-      key: "ce",
-      onConfirm: handleConfirmExit,
-      onCancel: function() { setShowConfirmExit(false); }
-    }));
-  }
-
-  if (disconnected && view !== "menu") {
-    children.push(React.createElement(DisconnectOverlay, {
-      key: "do",
-      onReconnect: handleReconnect,
-      onMenu: function() { setView("menu"); setDisconnected(false); }
-    }));
-  }
-
-  if (trumpFlash) {
-    children.push(React.createElement(TrumpFlashOverlay, {
-      key: "tf",
-      suit: trumpFlash.suit
-    }));
-  }
-
-  children.push(React.createElement(ToastContainer, { key: "tc", toasts: toasts }));
-
-  return React.createElement(React.Fragment, null, children);
-}
-
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(React.createElement(App));
+  ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+})();
 </script>
 </body>
 </html>
 """
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
