@@ -804,7 +804,7 @@ input:focus{border-color:var(--gold)}
   "use strict";
   var e = React.createElement;
   var FR = React.Fragment;
-  var useState = React.useState, useEffect = React useEffect, useRef = React.useRef;
+  var useState = React.useState, useEffect = React.useEffect, useRef = React.useRef;
 
   var SUIT_GLYPH = { S: "\\u2660", H: "\\u2665", D: "\\u2666", C: "\\u2663" };
   var SUIT_NAME = { S: "Spades", H: "Hearts", D: "Diamonds", C: "Clubs" };
