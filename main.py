@@ -942,7 +942,7 @@ input:focus{border-color:var(--gold)}
     var f = props.flash;
     return e("div", { key: f.id, className: "trump-flash" },
       e("div", { className: "tf-glyph " + (isRed(f.suit) ? "red" : "blk") }, SUIT_GLYPH[f.suit]),
-      e("div", { className: "tf-label" }, cardLabel(f.card) + " \\u2014 " + SUIT_NAME[f.suit] + " is trump"));
+      e("div", { className: "tf-label" }, cardLabel(f.card) + " \\u2014 " + SUIT_NAME[f.suit]));
   }
   function ResultOverlay(props) {
     var gs = props.gs;
