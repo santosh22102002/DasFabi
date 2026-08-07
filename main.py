@@ -694,9 +694,11 @@ input:focus{border-color:var(--gold)}
 .team-pick{display:flex;gap:10px}
 .team-btn{flex:1;padding:14px 8px;border-radius:14px;border:2px solid #ffffff2e;
   background:#ffffff0d;color:var(--ink);font-size:16px;font-weight:700;cursor:pointer;
-  display:flex;flex-direction:column;gap:2px;align-items:center}
-.team-btn.sel.ta{border-color:var(--ta);background:#6ab7ff22}
-.team-btn.sel.tb{border-color:var(--tb);background:#ff8a8022}
+  display:flex;flex-direction:column;gap:2px;align-items:center;
+  transition:border-color .12s,background .12s,box-shadow .12s,transform .12s}
+.team-btn.sel{transform:translateY(-2px)}
+.team-btn.sel.ta{border-color:var(--ta);background:#6ab7ff2b;box-shadow:0 0 14px #6ab7ff66}
+.team-btn.sel.tb{border-color:var(--tb);background:#ff8a802b;box-shadow:0 0 14px #ff8a8066}
 .muted{color:var(--muted)} .small{font-size:13px} .center-text{text-align:center}
 .room-code{color:var(--gold);letter-spacing:4px;font-weight:800}
 .chip{display:inline-block;background:#ffffff22;border-radius:8px;padding:1px 7px;
@@ -987,13 +989,15 @@ input:focus{border-color:var(--gold)}
         "Join Room", e("span", { className: "btn-sub" }, "Enter a room code")),
       e("button", { className: "btn ghost", onClick: props.onBack }, "Back"));
   }
-  function TeamPicker(props) {
+    function TeamPicker(props) {
     return e("div", { className: "team-pick" }, ["A", "B"].map(function (t) {
+      var sel = props.team === t;
       return e("button", {
         key: t, type: "button",
-        className: "team-btn " + t.toLowerCase() + (props.team === t ? " sel" : ""),
+        className: "team-btn t" + t.toLowerCase() + (sel ? " sel" : ""),
         onClick: function () { props.setTeam(t); }
-      }, "Team " + t, e("span", { className: "btn-sub" }, "You + one partner"));
+      }, "Team " + t,
+        e("span", { className: "btn-sub" }, sel ? "\\u2713 Your team" : "You + one partner"));
     }));
   }
   function CreateView(props) {
