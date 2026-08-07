@@ -853,7 +853,6 @@ input:focus{border-color:var(--gold)}
     return e("div", { className: "score-cluster" },
       e(TeamPanel, { team: "A", gs: gs }),
       e("div", { className: "trump-box" },
-        e("div", { className: "trump-label" }, gs.trump ? "TRUMP" : "TRUMP?"),
         gs.trump_card
           ? e(Card, { card: gs.trump_card, w: 42, pop: true })
           : e("div", { className: "card back mini-card" }, "?")),
