@@ -658,7 +658,7 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Mendikot</title>
+<title>ꯗ꯭ꯁ ꯐꯥꯕꯤ</title>
 <style>
 :root{
   --bg:#0b2318; --felt1:#2f8f5e; --felt2:#1c6440; --felt3:#124a2d;
@@ -920,7 +920,7 @@ input:focus{border-color:var(--gold)}
         props.selected
           ? e("button", { className: "btn gold",
               onClick: function () { props.revealCard(props.selected); } },
-              "Reveal " + cardLabel(props.selected) + " as trump")
+              "Reveal " + cardLabel(props.selected))
           : e("div", { className: "reveal-hint" },
               "You can't follow suit \\u2014 tap a card to reveal it as trump")) : null,
       e("div", { className: "hand-strip", ref: ref }, gs.hand.map(function (c) {
@@ -972,8 +972,8 @@ input:focus{border-color:var(--gold)}
   function MenuView(props) {
     return e("div", { className: "view center" },
       e("div", { className: "logo" },
-        e("h1", null, "MENDIKOT"),
-        e("p", { className: "tagline" }, "Capture the mendi \\u2014 the four tens")),
+        e("h1", null, "ꯗ꯭ꯁ ꯐꯥꯕꯤ"),
+        e("p", { className: "tagline" }, "♥️♦️♠️♣️")),
       e("button", { className: "btn gold big", onClick: props.onSolo },
         "Solo", e("span", { className: "btn-sub" }, "Instant game vs 3 bots")),
       e("button", { className: "btn green big", onClick: props.onFriends },
