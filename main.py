@@ -922,7 +922,7 @@ input:focus{border-color:var(--gold)}
               onClick: function () { props.revealCard(props.selected); } },
               "Reveal " + cardLabel(props.selected))
           : e("div", { className: "reveal-hint" },
-              "You can't follow suit \\u2014 tap a card to reveal it as trump")) : null,
+              "You can't follow card \\u2014 tap a card to reveal it")) : null,
       e("div", { className: "hand-strip", ref: ref }, gs.hand.map(function (c) {
         var isLegal = legal.indexOf(c) >= 0;
         var sel = props.selected === c;
@@ -1067,7 +1067,7 @@ input:focus{border-color:var(--gold)}
     var status;
     if (gs.complete) status = "";
     else if (gs.paused) status = "Trick complete\\u2026";
-    else if (myTurn) status = gs.must_reveal ? "Reveal trump!" : "Your turn";
+    else if (myTurn) status = gs.must_reveal ? "Reveal!" : "Your turn";
     else status = seatName(gs, gs.turn) + " is playing\\u2026";
     var posCls = { 1: "pos-left", 2: "pos-top", 3: "pos-right" };
     return e("div", { className: "game" },
